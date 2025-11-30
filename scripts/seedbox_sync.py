@@ -8,6 +8,8 @@ over SFTP (SSH File Transfer Protocol). It mirrors files from the remote
 Features:
 - lftp mirror over SFTP (secure SSH connection)
 - Parallel downloads with pget (multiple connections per file)
+- Real-time download progress in CLI
+- Exclude unwanted files (*.meta)
 - Remove source files after successful transfer
 - Clean up *.lftp temp files
 - Lock file to prevent concurrent execution
@@ -83,6 +85,9 @@ set xfer:temp-file-name *{lftp['temp_suffix']}
     # Mirror command
     mirror_opts = f"-P {lftp['parallel_files']} -c -v"
 
+    # Exclude unwanted files
+    mirror_opts += ' --exclude "*.meta"'
+
     # Only remove source files if not in dry-run mode
     if not dry_run:
         mirror_opts += " --Remove-source-files --Remove-source-dirs"
@@ -128,34 +133,37 @@ def sync_seedbox(config: dict, dry_run: bool = False) -> bool:
             logger.info(f"Remote: {config['seedbox']['remote_downloads']}")
             logger.info(f"Local: {config['paths']['downloads_done']}")
 
-            # Execute lftp
+            # Execute lftp with real-time output
             logger.info("Starting lftp mirror...")
+            print("\n" + "="*60)
+            print("LFTP TRANSFER IN PROGRESS")
+            print("="*60 + "\n")
+
             result = subprocess.run(
                 lftp_cmd,
                 shell=True,
-                capture_output=True,
                 text=True,
                 timeout=3600  # 1 hour timeout
             )
+
+            print("\n" + "="*60)
 
             # Check result
             if result.returncode != 0:
                 error_msg = f"lftp failed with exit code {result.returncode}"
                 logger.error(error_msg)
-                logger.error(f"stderr: {result.stderr}")
+                print(f"\nERROR: {error_msg}")
 
                 notifier.notify_error(
                     'seedbox_sync',
                     error_msg,
-                    details=result.stderr[:500]  # Limit error details
+                    details="Check logs/seedbox_sync_lftp.log for details"
                 )
                 return False
 
             logger.info("lftp mirror completed successfully")
-
-            # Log output
-            if result.stdout:
-                logger.debug(f"lftp output:\n{result.stdout}")
+            print("LFTP TRANSFER COMPLETED")
+            print("="*60 + "\n")
 
             # Clean up temp files (*.lftp)
             if not dry_run:
