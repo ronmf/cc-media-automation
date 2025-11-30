@@ -91,27 +91,35 @@ Automated media server management suite for Servarr stack with seedbox integrati
 
 ### Medium Priority
 3. **`video_cleanup.py`** - Remove extras/trailers/samples
-   - Keep only main video (> 500MB) + subtitles
-   - Delete via Radarr/Sonarr APIs or filesystem
+   - Pattern-based deletion: trailers, featurettes, samples
+   - Size-based deletion: small videos < 300MB (movies only)
+   - Series episodes kept regardless of size
    - Don't preserve NFO/fanart (Jellyfin retrieves)
 
-4. **`jellyfin_notify.py`** - Update Jellyfin library
+4. **`library_resort.py`** - Resort content between kids/adult libraries
+   - Check age ratings in Radarr/Sonarr metadata
+   - Move misplaced movies: movies ↔ kids_movies
+   - Move misplaced series: series ↔ kids_series
+   - Update root folder paths via API
+   - Flags: --movies-only, --series-only
+
+5. **`jellyfin_notify.py`** - Update Jellyfin library
    - Poll Radarr/Sonarr history
    - Trigger full library scan
    - Can be called manually or via cron
 
 ### Low Priority
-5. **`library_analyzer.py`** - Watch pattern analysis
+6. **`library_analyzer.py`** - Watch pattern analysis
    - Score items 0-100 for deletion candidacy
    - Check Prowlarr for re-acquisition difficulty
    - Export CSV reports
 
-6. **`library_reducer.py`** - Tag for deletion
+7. **`library_reducer.py`** - Tag for deletion
    - Tag items in Radarr/Sonarr (don't delete directly)
    - Protect 1080p content
    - Threshold: 80%+ score
 
-7. **`servarr_menu.py`** - Interactive CLI menu
+8. **`servarr_menu.py`** - Interactive CLI menu
    - Dry-run toggle (default: ON)
    - Log viewer, config display
    - "Run All" for daily tasks
@@ -177,11 +185,15 @@ python3 servarr_menu.py
 
 # Individual scripts (dry-run)
 python3 scripts/seedbox_sync.py --dry-run
+python3 scripts/seedbox_purge.py --dry-run
 python3 scripts/video_cleanup.py --dry-run
+python3 scripts/library_resort.py --dry-run
 python3 scripts/library_analyzer.py --dry-run
 
 # Execute mode (CAUTION)
 python3 scripts/seedbox_sync.py --execute
+python3 scripts/library_resort.py --execute --movies-only
+python3 scripts/library_resort.py --execute --series-only
 ```
 
 ### Testing
