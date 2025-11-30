@@ -1,0 +1,52 @@
+# Servarr Media Automation - Git Ignore
+
+# Secrets and credentials
+config.yaml
+secrets.conf
+*.key
+*.pem
+
+# Logs
+logs/
+*.log
+
+# Backups and reports
+backups/
+reports/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.lftp
+.lock
+
+# Archives (keep in separate repo)
+_archive/

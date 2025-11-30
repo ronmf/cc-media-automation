@@ -1,0 +1,18 @@
+# Servarr Automation Suite - Python Dependencies
+
+# Core libraries
+requests>=2.31.0
+pyyaml>=6.0.1
+python-dateutil>=2.8.2
+
+# SSH/SFTP for seedbox
+paramiko>=3.3.1
+
+# XML parsing for config files
+lxml>=4.9.3
+
+# Pretty tables for reports
+tabulate>=0.9.0
+
+# Optional: Progress bars
+tqdm>=4.66.1
