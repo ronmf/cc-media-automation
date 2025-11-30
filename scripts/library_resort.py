@@ -43,6 +43,7 @@ from utils.logger import setup_logging
 from utils.ntfy_notifier import create_notifier
 from utils.validators import acquire_lock
 from utils.api_clients import RadarrAPI, SonarrAPI
+from utils.tmdb_client import create_tmdb_client
 
 
 def is_kids_rating(certification: str, kids_ratings: List[str]) -> bool:
@@ -85,6 +86,9 @@ def resort_movies(
         config['radarr']['api_key']
     )
 
+    # Create TMDB client for fetching missing certifications
+    tmdb = create_tmdb_client(config)
+
     kids_ratings = config['thresholds']['kids_age_ratings']['movies']
     movies_path = config['paths']['movies']
     kids_movies_path = config['paths']['kids_movies']
@@ -103,6 +107,22 @@ def resort_movies(
         movie_id = movie.get('id')
         current_path = movie.get('path', '')
         certification = movie.get('certification', '')
+
+        # Check for missing certification and fetch from TMDB if needed
+        if not certification:
+            logger.info(f"Fetching certification from TMDB: {title} ({year})")
+            try:
+                tmdb_cert = tmdb.get_movie_certification(title, year)
+                if tmdb_cert:
+                    certification = tmdb_cert
+                    # Update in Radarr if not in dry-run
+                    if not dry_run:
+                        radarr.update_movie(movie_id, {'certification': tmdb_cert})
+                        logger.info(f"Updated certification: {title} → {tmdb_cert}")
+                    else:
+                        logger.info(f"[DRY-RUN] Would update: {title} → {tmdb_cert}")
+            except Exception as e:
+                logger.warning(f"Failed to fetch certification for {title}: {e}")
 
         # Determine current library by checking folder names
         # More flexible than exact path matching
@@ -158,10 +178,15 @@ def resort_movies(
             new_path = str(Path(kids_movies_path) / folder_name)
 
             try:
+                # Update metadata
                 radarr.update_movie(
                     item['id'],
                     {'path': new_path, 'rootFolderPath': kids_movies_path}
                 )
+                logger.info(f"Updated path: {item['title']} → {new_path}")
+
+                # Trigger file move operation
+                radarr.move_movie(item['id'])
                 logger.info(f"MOVED to kids: {item['title']} ({item['year']})")
             except Exception as e:
                 logger.error(f"Failed to move {item['title']}: {e}")
@@ -173,10 +198,15 @@ def resort_movies(
             new_path = str(Path(movies_path) / folder_name)
 
             try:
+                # Update metadata
                 radarr.update_movie(
                     item['id'],
                     {'path': new_path, 'rootFolderPath': movies_path}
                 )
+                logger.info(f"Updated path: {item['title']} → {new_path}")
+
+                # Trigger file move operation
+                radarr.move_movie(item['id'])
                 logger.info(f"MOVED to adult: {item['title']} ({item['year']})")
             except Exception as e:
                 logger.error(f"Failed to move {item['title']}: {e}")
@@ -211,6 +241,9 @@ def resort_series(
         config['sonarr']['api_key']
     )
 
+    # Create TMDB client for fetching missing certifications
+    tmdb = create_tmdb_client(config)
+
     kids_ratings = config['thresholds']['kids_age_ratings']['series']
     series_path = config['paths']['series']
     kids_series_path = config['paths']['kids_series']
@@ -229,6 +262,22 @@ def resort_series(
         series_id = show.get('id')
         current_path = show.get('path', '')
         certification = show.get('certification', '')
+
+        # Check for missing certification and fetch from TMDB if needed
+        if not certification:
+            logger.info(f"Fetching certification from TMDB: {title} ({year})")
+            try:
+                tmdb_cert = tmdb.get_tv_certification(title, year)
+                if tmdb_cert:
+                    certification = tmdb_cert
+                    # Update in Sonarr if not in dry-run
+                    if not dry_run:
+                        sonarr.update_series(series_id, {'certification': tmdb_cert})
+                        logger.info(f"Updated certification: {title} → {tmdb_cert}")
+                    else:
+                        logger.info(f"[DRY-RUN] Would update: {title} → {tmdb_cert}")
+            except Exception as e:
+                logger.warning(f"Failed to fetch certification for {title}: {e}")
 
         # Determine current library by checking folder names
         path_lower = current_path.lower()
@@ -283,10 +332,15 @@ def resort_series(
             new_path = str(Path(kids_series_path) / folder_name)
 
             try:
+                # Update metadata
                 sonarr.update_series(
                     item['id'],
                     {'path': new_path, 'rootFolderPath': kids_series_path}
                 )
+                logger.info(f"Updated path: {item['title']} → {new_path}")
+
+                # Trigger file move operation
+                sonarr.move_series(item['id'])
                 logger.info(f"MOVED to kids: {item['title']} ({item['year']})")
             except Exception as e:
                 logger.error(f"Failed to move {item['title']}: {e}")
@@ -298,10 +352,15 @@ def resort_series(
             new_path = str(Path(series_path) / folder_name)
 
             try:
+                # Update metadata
                 sonarr.update_series(
                     item['id'],
                     {'path': new_path, 'rootFolderPath': series_path}
                 )
+                logger.info(f"Updated path: {item['title']} → {new_path}")
+
+                # Trigger file move operation
+                sonarr.move_series(item['id'])
                 logger.info(f"MOVED to adult: {item['title']} ({item['year']})")
             except Exception as e:
                 logger.error(f"Failed to move {item['title']}: {e}")

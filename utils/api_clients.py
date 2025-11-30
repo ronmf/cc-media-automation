@@ -306,6 +306,38 @@ class RadarrAPI(BaseAPI):
         movie.update(updates)
         return self._request('PUT', f'/api/v3/movie/{movie_id}', json=movie)
 
+    def send_command(self, command_name: str, **kwargs) -> Dict[str, Any]:
+        """Send a command to Radarr.
+
+        Args:
+            command_name: Command name (e.g., 'MoveMovie', 'RescanMovie')
+            **kwargs: Command parameters (e.g., movieId=1)
+
+        Returns:
+            Command response dictionary
+
+        Example:
+            >>> radarr.send_command('MoveMovie', movieId=1)
+            >>> radarr.send_command('RescanMovie', movieId=1)
+        """
+        command_data = {'name': command_name}
+        command_data.update(kwargs)
+        return self._request('POST', '/api/v3/command', json=command_data)
+
+    def move_movie(self, movie_id: int) -> Dict[str, Any]:
+        """Trigger file move operation for a movie.
+
+        Args:
+            movie_id: Movie ID
+
+        Returns:
+            Command response dictionary
+
+        Example:
+            >>> radarr.move_movie(1)
+        """
+        return self.send_command('MoveMovie', movieId=movie_id)
+
     def get_quality_profiles(self) -> List[Dict[str, Any]]:
         """Get available quality profiles.
 
@@ -553,6 +585,38 @@ class SonarrAPI(BaseAPI):
         series = self.get_series_by_id(series_id)
         series.update(updates)
         return self._request('PUT', f'/api/v3/series/{series_id}', json=series)
+
+    def send_command(self, command_name: str, **kwargs) -> Dict[str, Any]:
+        """Send a command to Sonarr.
+
+        Args:
+            command_name: Command name (e.g., 'MoveSeries', 'RescanSeries')
+            **kwargs: Command parameters (e.g., seriesId=1)
+
+        Returns:
+            Command response dictionary
+
+        Example:
+            >>> sonarr.send_command('MoveSeries', seriesId=1)
+            >>> sonarr.send_command('RescanSeries', seriesId=1)
+        """
+        command_data = {'name': command_name}
+        command_data.update(kwargs)
+        return self._request('POST', '/api/v3/command', json=command_data)
+
+    def move_series(self, series_id: int) -> Dict[str, Any]:
+        """Trigger file move operation for a series.
+
+        Args:
+            series_id: Series ID
+
+        Returns:
+            Command response dictionary
+
+        Example:
+            >>> sonarr.move_series(1)
+        """
+        return self.send_command('MoveSeries', seriesId=series_id)
 
     def get_quality_profiles(self) -> List[Dict[str, Any]]:
         """Get available quality profiles.
