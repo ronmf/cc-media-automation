@@ -3,12 +3,13 @@
 
 This script scans media folders and removes extra files like trailers,
 featurettes, samples, and metadata files (NFO, fanart, posters).
-It keeps only the main video file (largest file > 500MB) and subtitle files.
+It keeps main video files and subtitle files.
 
 Features:
 - Scan multiple media folders (movies, series, kids_movies, kids_series)
-- Identify main video file by size (largest > 500MB)
-- Identify extras by patterns (trailer, sample, etc.) or size (< 500MB)
+- Identify extras by patterns (trailer, sample, featurette, etc.)
+- For MOVIES: Also delete small videos (< min_size_mb) as likely samples
+- For SERIES: Keep all episodes regardless of size (no size-based deletion)
 - Direct filesystem deletion for extras (not tracked by Radarr/Sonarr)
 - Remove metadata files (NFO, fanart, posters) - Jellyfin retrieves these
 - Keep subtitle files (.srt, .ass, .sub)
@@ -56,7 +57,8 @@ def cleanup_folder(
     folder_name: str,
     config: dict,
     logger,
-    dry_run: bool = False
+    dry_run: bool = False,
+    is_series: bool = False
 ) -> Dict[str, int]:
     """Clean up extras and metadata in a media folder.
 
@@ -66,6 +68,7 @@ def cleanup_folder(
         config: Configuration dictionary
         logger: Logger instance
         dry_run: If True, don't actually delete files
+        is_series: If True, don't delete small files (series have many episodes)
 
     Returns:
         Dictionary with stats (extras_deleted, metadata_deleted, space_freed_mb)
@@ -130,8 +133,9 @@ def cleanup_folder(
                     except OSError as e:
                         logger.error(f"Failed to delete {video_name}: {e}")
 
-            # Check if it's small (likely extra/sample)
-            else:
+            # Check if it's small (likely extra/sample) - ONLY for movies
+            # For series, all episodes are legitimate, don't delete by size
+            elif not is_series:
                 file_size = os.path.getsize(video_file)
                 size_mb = file_size / (1024 * 1024)
 
@@ -231,12 +235,16 @@ def cleanup_videos(config: dict, dry_run: bool = False, specific_folder: str = N
             }
 
             for folder_name, folder_path in folders.items():
+                # Determine if this is a series folder
+                is_series_folder = 'series' in folder_name.lower()
+
                 stats = cleanup_folder(
                     folder_path,
                     folder_name,
                     config,
                     logger,
-                    dry_run
+                    dry_run,
+                    is_series=is_series_folder
                 )
 
                 # Accumulate stats
@@ -299,8 +307,9 @@ Examples:
   %(prog)s --execute --config /path/to/config.yaml
 
 Notes:
-  - Keeps only main video file (largest file > 500 MB) + subtitles
-  - Deletes extras: trailers, featurettes, samples, etc.
+  - Pattern-based deletion: trailers, featurettes, samples, etc. (all folders)
+  - Size-based deletion: small videos < 300 MB (MOVIES ONLY, not series)
+  - Series episodes are kept regardless of size (handles anime, sitcoms)
   - Deletes metadata: NFO files, fanart, posters (Jellyfin retrieves these)
   - Keeps subtitle files (.srt, .ass, .sub)
   - Lock file prevents concurrent execution
