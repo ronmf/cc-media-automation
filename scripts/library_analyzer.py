@@ -38,6 +38,7 @@ import sys
 import argparse
 import os
 import csv
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
@@ -424,7 +425,9 @@ def check_prowlarr_availability(items: List[Dict], config: Dict, logger) -> List
         Updated items with indexer_count field
     """
     if not config['analyzer']['check_prowlarr']:
-        logger.info("Prowlarr check disabled")
+        logger.info("Prowlarr check disabled (set analyzer.check_prowlarr: true to enable)")
+        for item in items:
+            item['indexer_count'] = 0
         return items
 
     try:
@@ -432,7 +435,9 @@ def check_prowlarr_availability(items: List[Dict], config: Dict, logger) -> List
         indexers = prowlarr.get_indexers()
         logger.info(f"Prowlarr: {len(indexers)} indexers available")
 
-        for item in items:
+        logger.info(f"Checking {len(items)} items against Prowlarr (this may take a while)...")
+
+        for idx, item in enumerate(items, 1):
             # Search for item
             try:
                 query = item['title']
@@ -448,11 +453,29 @@ def check_prowlarr_availability(items: List[Dict], config: Dict, logger) -> List
                     item['score'] = int(item['score'] * 0.7)  # Reduce score by 30%
                     item['reason'] += f" (rare: {item['indexer_count']} indexers)"
 
-            except APIError:
+                # Progress logging
+                if idx % 10 == 0:
+                    logger.info(f"  Checked {idx}/{len(items)} items...")
+
+                # Rate limiting: wait 0.5 seconds between requests
+                time.sleep(0.5)
+
+            except APIError as e:
+                logger.warning(f"Search failed for '{item['title']}': {e}")
                 item['indexer_count'] = 0
+            except Exception as e:
+                logger.warning(f"Unexpected error searching '{item['title']}': {e}")
+                item['indexer_count'] = 0
+
+        logger.info(f"Prowlarr check completed for {len(items)} items")
 
     except APIError as e:
         logger.warning(f"Could not connect to Prowlarr: {e}")
+        logger.warning("Skipping Prowlarr availability check")
+        for item in items:
+            item['indexer_count'] = 0
+    except Exception as e:
+        logger.error(f"Unexpected Prowlarr error: {e}")
         for item in items:
             item['indexer_count'] = 0
 
