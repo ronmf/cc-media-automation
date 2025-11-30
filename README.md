@@ -90,7 +90,7 @@ python3 scripts/seedbox_purge.py --dry-run --verbose
 | Script | Purpose | Frequency | Priority |
 |--------|---------|-----------|----------|
 | **seedbox_sync.py** | lftp parallel downloads | Every 30 min | HIGH |
-| **seedbox_purge.py** | Hash-based torrent deletion | Daily at 3 AM | HIGH |
+| **seedbox_purge.py** | 3-phase cleanup (torrents + files) | Daily at 3 AM | HIGH |
 | **video_cleanup.py** | Remove extras/trailers | Weekly | MEDIUM |
 | **jellyfin_notify.py** | Trigger library scans | Every 10 min | MEDIUM |
 | **library_analyzer.py** | Watch pattern analysis | Monthly | LOW |
@@ -201,6 +201,100 @@ for hash_id in rtorrent_seeding_torrents:
 ```
 
 **Result**: 100% accurate matching, no filename parsing errors.
+
+---
+
+## 🔄 3-Phase Cleanup Strategy
+
+The `seedbox_purge.py` script implements a comprehensive cleanup across three storage layers:
+
+### Phase 1: Active Torrents (XMLRPC)
+
+**Purpose**: Delete torrents that have been imported and meet seeding policy
+
+**Method**:
+- Query rtorrent for all seeding torrents via XMLRPC
+- Cross-reference with Radarr/Sonarr history by hash
+- Delete if `ratio >= 1.5 OR age >= 2 days`
+
+**Example**:
+```bash
+python3 scripts/seedbox_purge.py --execute --skip-remote-files --skip-local-done
+```
+
+**Output**:
+```
+PHASE 1: ACTIVE TORRENTS (XMLRPC)
+═════════════════════════════════════════
+Seeding torrents found:        47
+Imported in Radarr/Sonarr:     42
+Policy met (deleted):          7
+Space freed:                   15.3 GB
+```
+
+### Phase 2: Remote /downloads Files (SSH)
+
+**Purpose**: Clean up orphaned files where torrent was removed but files remain
+
+**Method**:
+- SSH to seedbox and scan `/downloads` directory
+- Check if each file exists locally in `downloads/_done`
+- Delete remote file if local copy exists (safe to remove)
+
+**Example**:
+```bash
+python3 scripts/seedbox_purge.py --execute --skip-torrents --skip-local-done
+```
+
+**Use Cases**:
+- Torrent removed manually but files remain
+- Failed torrent deletion left orphaned files
+- Space cleanup without torrent client access
+
+### Phase 3: Local _done Files (Filesystem)
+
+**Purpose**: Clean up staging files after successful import to library
+
+**Method**:
+- Scan local `downloads/_done` directory
+- Query Radarr/Sonarr for all library file paths
+- Delete staging file if it exists in final library location
+
+**Example**:
+```bash
+python3 scripts/seedbox_purge.py --execute --skip-torrents --skip-remote-files
+```
+
+**Benefits**:
+- Frees up staging space automatically
+- Removes duplicate files after import
+- No manual cleanup required
+
+### Combined Execution
+
+**Run all three phases**:
+```bash
+python3 scripts/seedbox_purge.py --execute --verbose
+```
+
+**Sample Output**:
+```
+═════════════════════════════════════════
+COMPREHENSIVE PURGE SUMMARY
+═════════════════════════════════════════
+
+Phase 1 (Torrents):      7 deleted    15.3 GB freed
+Phase 2 (Remote Files):  12 deleted   28.7 GB freed
+Phase 3 (Local Staging): 18 deleted   42.1 GB freed
+
+TOTAL ACROSS ALL PHASES: 37 deleted   86.1 GB freed
+═════════════════════════════════════════
+```
+
+**Selective Execution Flags**:
+- `--skip-torrents` - Skip Phase 1
+- `--skip-remote-files` - Skip Phase 2
+- `--skip-local-done` - Skip Phase 3
 
 ---
 

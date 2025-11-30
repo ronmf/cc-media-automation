@@ -74,14 +74,16 @@ Automated media server management suite for Servarr stack with seedbox integrati
    - Remove source files after successful transfer
    - Clean up `*.lftp` temp files
 
-2. **`seedbox_purge.py`** - ✨ Intelligent torrent purge (HASH-BASED)
-   - Delete torrents via rtorrent XMLRPC API
-   - Cross-reference Radarr/Sonarr by hash (downloadId)
+2. **`seedbox_purge.py`** - ✨ 3-Phase Comprehensive Cleanup
+   - **Phase 1 (XMLRPC)**: Delete torrents by hash matching (downloadId)
+   - **Phase 2 (SSH)**: Clean orphaned remote /downloads files
+   - **Phase 3 (Filesystem)**: Purge local _done staging files
    - Policy: ratio >= 1.5 OR age >= 2 days
-   - 100% accurate (no filename matching issues)
+   - 100% accurate hash-based matching
    - Monitor 750GB quota (warn at 700GB)
+   - Flags: --skip-torrents, --skip-remote-files, --skip-local-done
 
-   **Note**: For SSH-based file cleanup, use `seedbox_file_cleanup.py`
+   **Note**: For legacy SSH-only file cleanup, use `seedbox_file_cleanup.py`
 
 ### Medium Priority
 3. **`video_cleanup.py`** - Remove extras/trailers/samples
