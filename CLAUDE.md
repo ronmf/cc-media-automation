@@ -88,10 +88,12 @@ Automated media server management suite for Servarr stack with seedbox integrati
    - **Phase 2 (SSH)**: Clean orphaned remote files (aligned with sync directories)
      - Checks same directories as seedbox_sync.py
      - Avoids duplicate cleanup when fallback is parent of primary
-   - **Phase 3 (Filesystem)**: ✨ Purge local _done staging files
-     - **FIXED**: Now uses Radarr/Sonarr import history to detect imported files
-     - Matches by original filename using `droppedPath` from history API
-     - Works even after Radarr/Sonarr rename files in library
+   - **Phase 3 (Filesystem)**: ✨ Purge local _done staging files with fallback detection
+     - **Primary detection**: Uses Radarr/Sonarr import history (matches by original filename)
+     - **Fallback detection**: Parses filenames and checks if episode/movie exists in library
+     - Catches manual imports without history records (e.g., My Hero Academia S08E08)
+     - Parses S##E## or #x# patterns, checks Sonarr for hasFile=true
+     - Same logic for movies using title + year matching in Radarr
      - Deletes confirmed imports and extras, keeps pending files
    - Policy: ratio >= 1.5 OR age >= 2 days
    - Kids content: G, PG, TV-Y, TV-Y7, TV-G, TV-PG → kids_movies/kids_series

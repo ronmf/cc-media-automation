@@ -1069,20 +1069,104 @@ def purge_remote_files(
     return deleted_count, total_size_deleted
 
 
+def check_episode_in_library(radarr: RadarrAPI, sonarr: SonarrAPI, filepath: Path, logger) -> bool:
+    """Check if a file's episode/movie exists in library with a file attached.
+
+    This function provides fallback detection for files that were manually imported
+    or have no history records. It parses the filename to extract metadata and
+    checks if that content exists in the library with hasFile=true.
+
+    Args:
+        radarr: Radarr API client
+        sonarr: Sonarr API client
+        filepath: Path to file in _done
+        logger: Logger instance
+
+    Returns:
+        True if episode/movie exists in library with file
+    """
+    try:
+        # Parse filename
+        parsed = parse_media_filename(filepath.name)
+        if not parsed:
+            return False
+
+        title, year, content_type = parsed
+
+        if content_type == 'movie':
+            # Search Radarr for movie
+            try:
+                movies = radarr._request('GET', '/api/v3/movie')
+                for movie in movies:
+                    movie_title = movie.get('title', '').lower()
+                    movie_year = movie.get('year', 0)
+
+                    # Match by title (fuzzy) and year (if available)
+                    if title.lower() in movie_title or movie_title in title.lower():
+                        if year is None or movie_year == year:
+                            if movie.get('hasFile'):
+                                logger.debug(f"Found movie in library: {movie['title']} ({movie_year})")
+                                return True
+                return False
+            except Exception as e:
+                logger.debug(f"Error checking Radarr for {title}: {e}")
+                return False
+
+        else:  # series
+            # Parse season/episode from filename
+            match = re.search(r'[Ss](\d{1,2})[Ee](\d{1,2})', filepath.name)
+            if not match:
+                # Try alternative format: 1x01
+                match = re.search(r'(\d{1,2})x(\d{1,2})', filepath.name)
+
+            if not match:
+                return False
+
+            season = int(match.group(1))
+            episode = int(match.group(2))
+
+            # Search Sonarr for series
+            try:
+                series_list = sonarr._request('GET', '/api/v3/series')
+                for series in series_list:
+                    series_title = series.get('title', '').lower()
+
+                    # Match by title (fuzzy)
+                    if title.lower() in series_title or series_title in title.lower():
+                        # Found series, check if episode has file
+                        episodes = sonarr._request('GET', f"/api/v3/episode?seriesId={series['id']}")
+                        for ep in episodes:
+                            if ep.get('seasonNumber') == season and ep.get('episodeNumber') == episode:
+                                if ep.get('hasFile'):
+                                    logger.debug(f"Found episode in library: {series['title']} S{season:02d}E{episode:02d}")
+                                    return True
+                return False
+            except Exception as e:
+                logger.debug(f"Error checking Sonarr for {title} S{season:02d}E{episode:02d}: {e}")
+                return False
+
+    except Exception as e:
+        logger.debug(f"Error in check_episode_in_library for {filepath.name}: {e}")
+        return False
+
+
 def purge_local_done(
     config: dict,
     library_files: Set[str],
     imported_done_files: Set[str],
+    radarr: RadarrAPI,
+    sonarr: SonarrAPI,
     logger,
     dry_run: bool = False,
     verbose: bool = False
 ) -> Tuple[int, int]:
-    """Phase 3: Purge local _done files and extras.
+    """Phase 3: Purge local _done files and extras with fallback detection.
 
     Deletes:
     1. Files that have been imported to Radarr/Sonarr library (via history check)
-    2. Extra files (trailers, samples, behind the scenes, txt, nfo, etc.)
-    3. Empty subdirectories after file cleanup
+    2. Files whose episodes/movies exist in library (fallback for manual imports)
+    3. Extra files (trailers, samples, behind the scenes, txt, nfo, etc.)
+    4. Empty subdirectories after file cleanup
 
     Keeps:
     - Main video files and subtitles that haven't been imported yet
@@ -1093,10 +1177,18 @@ def purge_local_done(
     - Only files and subdirectories within _done are cleaned
     - Empty _done folder is preserved
 
+    FALLBACK DETECTION:
+    - Files without import history are checked via filename parsing
+    - Parses S##E## or #x# patterns to extract episode info
+    - Checks if that episode exists in Sonarr with hasFile=true
+    - Same logic for movies using title + year matching
+
     Args:
         config: Configuration dictionary
         library_files: Set of file paths in Radarr/Sonarr libraries (unused, kept for compatibility)
         imported_done_files: Set of original filenames imported from _done (from history)
+        radarr: Radarr API client (for fallback detection)
+        sonarr: Sonarr API client (for fallback detection)
         logger: Logger instance
         dry_run: If True, don't actually delete
         verbose: If True, show all files
@@ -1131,11 +1223,18 @@ def purge_local_done(
 
         # Check if this file was imported from _done (via history)
         filename = item.name
-        was_imported = filename in imported_done_files
+        was_imported_history = filename in imported_done_files
+
+        # Fallback: Check if episode/movie exists in library (for manual imports)
+        was_imported_library = False
+        if not was_imported_history and classification in ('video', 'subtitle'):
+            was_imported_library = check_episode_in_library(radarr, sonarr, item, logger)
+
+        was_imported = was_imported_history or was_imported_library
 
         # Decision logic:
         # 1. If it's an extra file, always delete
-        # 2. If it's a main video/subtitle, only delete if imported (confirmed via history)
+        # 2. If it's a main video/subtitle, only delete if imported (confirmed via history OR library check)
         should_delete = False
         reason = ""
 
@@ -1145,7 +1244,10 @@ def purge_local_done(
             extras_deleted += 1
         elif was_imported:
             should_delete = True
-            reason = "imported to library (confirmed via history)"
+            if was_imported_history:
+                reason = "imported to library (confirmed via history)"
+            else:
+                reason = "episode/movie exists in library (manual import detected)"
         else:
             if verbose:
                 logger.info(f"KEEP (not imported yet): {item} [{classification}]")
@@ -1314,7 +1416,7 @@ def comprehensive_purge(config: dict, args) -> bool:
             # Phase 3: Local _done cleanup
             if not args.skip_local_done:
                 deleted, size_freed = purge_local_done(
-                    config, library_files, imported_done_files, logger,
+                    config, library_files, imported_done_files, radarr, sonarr, logger,
                     dry_run=args.dry_run, verbose=args.verbose
                 )
                 total_deleted += deleted
@@ -1398,7 +1500,9 @@ Phase 2: Remote /downloads Files (SSH)
 
 Phase 3: Local _done Files (Filesystem)
   - Clean up staging directory after import
-  - Delete files that exist in final library location
+  - Delete files confirmed imported via history
+  - Fallback: Parse filenames and check if episode/movie exists in library
+  - Catches manual imports without history records
 
 Examples:
   # Full cleanup (dry-run)

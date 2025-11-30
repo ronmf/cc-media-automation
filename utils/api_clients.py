@@ -21,6 +21,59 @@ class APIError(Exception):
     pass
 
 
+def parse_validation_errors(response_json: Any) -> str:
+    """Parse Radarr/Sonarr validation error responses into human-readable messages.
+
+    Args:
+        response_json: List of validation error dicts from API, or other response data
+
+    Returns:
+        Human-readable error message
+
+    Example:
+        >>> errors = [{'errorCode': 'MovieExistsValidator', 'errorMessage': 'This movie has already been added', 'attemptedValue': 12345}]
+        >>> parse_validation_errors(errors)
+        'Movie already exists (TMDB ID: 12345)'
+    """
+    if not response_json or not isinstance(response_json, list):
+        return str(response_json)
+
+    messages = []
+    for error in response_json:
+        if not isinstance(error, dict):
+            messages.append(str(error))
+            continue
+
+        error_msg = error.get('errorMessage', '')
+        error_code = error.get('errorCode', '')
+        attempted_value = error.get('attemptedValue')
+        property_name = error.get('propertyName', '')
+
+        # Build human-readable message
+        if 'ExistsValidator' in error_code:
+            if 'Movie' in error_code:
+                messages.append(f"Movie already exists (TMDB ID: {attempted_value})")
+            elif 'Series' in error_code:
+                messages.append(f"Series already exists (TVDB ID: {attempted_value})")
+            else:
+                messages.append(f"{error_msg} ({property_name}: {attempted_value})")
+        elif 'RootFolderValidator' in error_code:
+            messages.append(f"Invalid root folder path: {attempted_value}")
+        elif 'QualityProfileValidator' in error_code:
+            messages.append(f"Invalid quality profile: {attempted_value}")
+        elif 'PathValidator' in error_code:
+            messages.append(f"Invalid path: {attempted_value}")
+        elif error_msg:
+            if attempted_value:
+                messages.append(f"{error_msg} ({property_name}: {attempted_value})")
+            else:
+                messages.append(error_msg)
+        else:
+            messages.append(f"Validation error: {error_code}")
+
+    return "; ".join(messages) if messages else str(response_json)
+
+
 class BaseAPI:
     """Base class for *arr API clients.
 
@@ -113,17 +166,34 @@ class BaseAPI:
                 elif e.response.status_code == 404:
                     raise APIError(f"Endpoint not found: {endpoint}")
                 else:
-                    self.logger.warning(f"HTTP error (attempt {attempt + 1}/{retries}): {e}")
+                    # Log detailed error information for 400 Bad Request
+                    if e.response.status_code == 400:
+                        self.logger.error(f"400 Bad Request:")
+                        self.logger.error(f"  URL: {url}")
+                        self.logger.error(f"  Method: {method}")
+                        if json:
+                            self.logger.error(f"  Request JSON: {json}")
+                        try:
+                            error_detail = e.response.json()
+                            validation_errors = parse_validation_errors(error_detail)
+                            self.logger.error(f"  Validation failed: {validation_errors}")
+                        except:
+                            self.logger.error(f"  Response text: {e.response.text}")
+                    else:
+                        # For non-400 errors, just log the HTTP error
+                        self.logger.warning(f"HTTP error: {e}")
+
                     if attempt < retries - 1:
                         time.sleep(2 ** attempt)
                     else:
                         raise APIError(f"HTTP error: {e}")
 
             except requests.exceptions.RequestException as e:
-                self.logger.warning(f"Request failed (attempt {attempt + 1}/{retries}): {e}")
                 if attempt < retries - 1:
+                    self.logger.warning(f"Request failed, retrying: {e}")
                     time.sleep(2 ** attempt)
                 else:
+                    self.logger.error(f"Request failed: {e}")
                     raise APIError(f"Request failed: {e}")
 
         raise APIError("Unexpected error in request retry loop")

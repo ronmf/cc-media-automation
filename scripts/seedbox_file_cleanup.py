@@ -1,6 +1,27 @@
 #!/usr/bin/env python3
 """Seedbox purge script - clean old files via SSH.
 
+⚠️  DEPRECATED: This script is legacy and lacks multi-directory support.
+
+Use seedbox_purge.py Phase 2 instead:
+    python3 scripts/seedbox_purge.py --execute --skip-auto-import --skip-torrents --skip-local-done
+
+Advantages of seedbox_purge.py:
+- Multi-directory cleanup (/_ready + /downloads fallback)
+- Library integration (knows what's imported to Radarr/Sonarr)
+- File classification (keeps videos/subs not yet imported)
+- Hash-based matching with active torrents
+- Comprehensive 4-phase cleanup strategy
+
+This script only:
+- Checks single directory (/downloads or /downloads/_ready)
+- Age-based deletion only (doesn't know if files are imported)
+- No integration with Radarr/Sonarr
+
+---
+
+LEGACY DOCUMENTATION (for backward compatibility):
+
 This script connects to the seedbox via SSH and removes files older than
 a configured threshold (default: 2 days). It verifies that files exist
 locally before deleting them remotely to prevent data loss.
@@ -169,11 +190,12 @@ def purge_seedbox(config: dict, dry_run: bool = False) -> bool:
                             logger.error(f"Failed to delete {remote_path}: {e}")
                             skipped_count += 1
 
-                # Clean up empty directories
+                # Clean up empty directories (respecting protected folders)
                 if not dry_run and deleted_count > 0:
                     logger.info("Cleaning up empty directories...")
-                    empty_dirs = ssh.delete_empty_directories(sb['remote_downloads'])
-                    logger.info(f"Removed {empty_dirs} empty directories")
+                    protected = config['safety'].get('protected_folders', [])
+                    empty_dirs = ssh.delete_empty_directories(sb['remote_downloads'], exclude_paths=protected)
+                    logger.info(f"Removed {empty_dirs} empty directories (protected folders preserved)")
 
                 # Summary
                 logger.info("="*60)
@@ -220,10 +242,32 @@ def purge_seedbox(config: dict, dry_run: bool = False) -> bool:
 
 def main():
     """Main entry point."""
+    # Print deprecation warning to stderr
+    print("", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+    print("⚠️  WARNING: This script is DEPRECATED", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Use seedbox_purge.py Phase 2 instead:", file=sys.stderr)
+    print("  python3 scripts/seedbox_purge.py --execute \\", file=sys.stderr)
+    print("    --skip-auto-import --skip-torrents --skip-local-done", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Advantages:", file=sys.stderr)
+    print("  ✅ Multi-directory support (/_ready + /downloads fallback)", file=sys.stderr)
+    print("  ✅ Library integration (knows what's imported)", file=sys.stderr)
+    print("  ✅ File classification (keeps videos/subs not imported)", file=sys.stderr)
+    print("  ✅ Hash-based matching with active torrents", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("This legacy script will be removed in a future version.", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+    print("", file=sys.stderr)
+
     parser = argparse.ArgumentParser(
-        description='Purge old files from seedbox after verifying local copies',
+        description='[DEPRECATED] Purge old files from seedbox after verifying local copies',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+⚠️  DEPRECATED: Use seedbox_purge.py --skip-auto-import --skip-torrents --skip-local-done
+
 Examples:
   # Dry-run (default - safe mode, shows what would be deleted)
   %(prog)s --dry-run

@@ -250,24 +250,82 @@ class SeedboxSSH:
         self.logger.debug(f"Deleted: {path}")
         return True
 
-    def delete_empty_directories(self, path: str) -> int:
-        """Delete empty directories recursively.
+    def delete_empty_directories(self, path: str, exclude_paths: Optional[List[str]] = None) -> int:
+        """Delete empty directories recursively, respecting protected folders.
 
         Args:
             path: Base directory path
+            exclude_paths: List of protected folder paths (e.g., ["/_ready", "/.recycle"])
+                          These directories will never be deleted, even if empty
 
         Returns:
             Number of directories deleted
+
+        Example:
+            >>> ssh.delete_empty_directories('/downloads', exclude_paths=['/_ready'])
+            # Will delete empty subdirectories but preserve /_ready folder itself
         """
         if not self.client:
             raise SeedboxError("Not connected to seedbox")
 
-        # Find and delete empty directories
-        cmd = f'find "{path}" -type d -empty -delete -print'
-        stdout, stderr, exit_code = self.execute_command(cmd)
+        if exclude_paths is None:
+            exclude_paths = []
 
-        deleted_dirs = stdout.strip().split('\n') if stdout.strip() else []
-        return len([d for d in deleted_dirs if d])
+        # Find all empty directories
+        find_cmd = f'find "{path}" -type d -empty -print'
+        stdout, stderr, exit_code = self.execute_command(find_cmd)
+
+        if exit_code != 0:
+            self.logger.warning(f"find command failed: {stderr}")
+            return 0
+
+        # Parse found directories
+        empty_dirs = [d.strip() for d in stdout.strip().split('\n') if d.strip()]
+
+        if not empty_dirs:
+            return 0
+
+        # Filter out protected directories
+        dirs_to_delete = []
+        protected_count = 0
+
+        for dir_path in empty_dirs:
+            # Check if this directory is protected
+            is_protected = False
+            for protected in exclude_paths:
+                # Match if directory path ends with protected path
+                # e.g., "/downloads/_ready" matches "/_ready"
+                if dir_path.endswith(protected) or dir_path == protected:
+                    is_protected = True
+                    protected_count += 1
+                    self.logger.debug(f"Skipping protected folder: {dir_path} (matches {protected})")
+                    break
+
+            if not is_protected:
+                dirs_to_delete.append(dir_path)
+
+        # Log protection summary
+        if protected_count > 0:
+            self.logger.info(f"Protected {protected_count} folder(s) from deletion")
+
+        # Delete non-protected directories
+        deleted_count = 0
+        for dir_path in dirs_to_delete:
+            try:
+                # Use rmdir (only removes if empty, safer than rm -rf)
+                cmd = f'rmdir "{dir_path}"'
+                _, stderr, exit_code = self.execute_command(cmd)
+
+                if exit_code == 0:
+                    deleted_count += 1
+                    self.logger.debug(f"Deleted empty directory: {dir_path}")
+                else:
+                    self.logger.debug(f"Could not delete {dir_path}: {stderr}")
+
+            except Exception as e:
+                self.logger.debug(f"Error deleting {dir_path}: {e}")
+
+        return deleted_count
 
     def get_disk_usage(self) -> Dict[str, float]:
         """Get disk usage statistics for the seedbox.

@@ -2,10 +2,14 @@
 """Seedbox synchronization script with lftp over SFTP.
 
 This script syncs downloads from the seedbox to local storage using lftp
-over SFTP (SSH File Transfer Protocol). It mirrors files from the remote
-/downloads directory to the local downloads/_done directory.
+over SFTP (SSH File Transfer Protocol). It intelligently checks multiple
+remote directories in priority order and syncs only when files are available.
 
 Features:
+- Multi-directory checking with priority fallback (read from config.yaml)
+  1. /downloads/_ready - completed torrents only (primary)
+  2. /downloads - all downloads including unfinished (fallback)
+- Pre-check for files before running lftp (prevents false errors on empty directories)
 - lftp mirror over SFTP (secure SSH connection)
 - Parallel downloads with pget (multiple connections per file)
 - Real-time download progress in CLI
@@ -14,7 +18,7 @@ Features:
 - Clean up *.lftp temp files
 - Lock file to prevent concurrent execution
 - Comprehensive logging and error handling
-- ntfy notifications on errors
+- ntfy notifications on errors (not sent when directories are empty)
 
 Usage:
     # Dry-run mode (default - shows what would be done)
@@ -26,9 +30,19 @@ Usage:
     # Custom config file
     python3 scripts/seedbox_sync.py --execute --config /path/to/config.yaml
 
+Configuration (config.yaml):
+    seedbox:
+      remote_downloads: "/downloads/_ready"  # Primary (completed torrents)
+      remote_downloads_fallback: "/downloads"  # Fallback (all torrents)
+
 Note:
     dediseedbox.com uses SFTP (SSH protocol on port 40685), not FTP.
     The script automatically uses sftp:// protocol for connection.
+
+    If all remote directories are empty or don't exist, the script exits
+    successfully without running lftp, preventing false error notifications.
+
+    Priority: /_ready is checked first (completed only), /downloads is fallback.
 """
 
 import sys
@@ -43,13 +57,107 @@ from utils.config_loader import load_config
 from utils.logger import setup_logging
 from utils.ntfy_notifier import create_notifier
 from utils.validators import acquire_lock, cleanup_temp_files
+from utils.seedbox_ssh import SeedboxSSH, SeedboxError
 
 
-def build_lftp_command(config: dict, dry_run: bool = False) -> str:
+def check_remote_has_files(config: dict, logger) -> tuple[bool, str]:
+    """Check if remote directories have any files to sync.
+
+    Checks directories in priority order:
+    1. remote_downloads (_ready folder) - completed torrents only
+    2. remote_downloads_fallback (/downloads) - includes unfinished torrents
+
+    Args:
+        config: Configuration dictionary
+        logger: Logger instance
+
+    Returns:
+        Tuple of (has_files: bool, sync_path: str)
+        - has_files: True if any directory has files
+        - sync_path: Path to use for syncing (priority directory with files)
+    """
+    sb = config['seedbox']
+
+    # Define directories to check in priority order
+    directories_to_check = []
+
+    # Primary: /_ready (completed torrents)
+    if 'remote_downloads' in sb:
+        directories_to_check.append({
+            'path': sb['remote_downloads'],
+            'description': 'completed torrents (_ready)'
+        })
+
+    # Fallback: /downloads (all torrents, including unfinished)
+    if 'remote_downloads_fallback' in sb:
+        directories_to_check.append({
+            'path': sb['remote_downloads_fallback'],
+            'description': 'all downloads (including unfinished)'
+        })
+
+    if not directories_to_check:
+        logger.error("No remote download paths configured in config.yaml")
+        return False, ""
+
+    logger.info(f"Checking {len(directories_to_check)} remote directories for files...")
+
+    try:
+        with SeedboxSSH(
+            host=sb['host'],
+            port=sb['port'],
+            username=sb['username'],
+            password=sb['password']
+        ) as ssh:
+            # Check each directory in priority order
+            for dir_info in directories_to_check:
+                remote_path = dir_info['path']
+                description = dir_info['description']
+
+                logger.info(f"Checking {remote_path} ({description})...")
+
+                # Check if directory exists first
+                if not ssh.path_exists(remote_path):
+                    logger.info(f"  Directory does not exist: {remote_path}")
+                    continue
+
+                # Use find to check for any files (not directories)
+                # Returns first file found, or empty if none
+                cmd = f'find "{remote_path}" -type f -print -quit'
+                stdout, stderr, exit_code = ssh.execute_command(cmd)
+
+                if exit_code != 0:
+                    logger.warning(f"  Failed to check directory: {stderr}")
+                    # Don't fail-safe here, continue to next directory
+                    continue
+
+                # If stdout is not empty, files found
+                if stdout.strip():
+                    logger.info(f"  ✓ Found files in {remote_path}")
+                    return True, remote_path
+                else:
+                    logger.info(f"  Directory is empty: {remote_path}")
+
+            # No files found in any directory
+            logger.info("No files to sync in any remote directory")
+            return False, ""
+
+    except SeedboxError as e:
+        logger.warning(f"SSH connection failed while checking remote directories: {e}")
+        # On connection error, assume there might be files (fail safe)
+        # Use primary remote_downloads path
+        return True, sb.get('remote_downloads', '/downloads/_ready')
+    except Exception as e:
+        logger.warning(f"Unexpected error checking remote directories: {e}")
+        # On unexpected error, assume there might be files (fail safe)
+        return True, sb.get('remote_downloads', '/downloads/_ready')
+
+
+def build_lftp_command(config: dict, sync_path: str, dry_run: bool = False) -> str:
     """Build lftp mirror command from configuration.
 
     Args:
         config: Configuration dictionary
+        sync_path: Remote path to sync from
         dry_run: If True, don't actually delete remote files
 
     Returns:
@@ -89,11 +197,13 @@ set xfer:temp-file-name *{lftp['temp_suffix']}
     mirror_opts += ' --exclude ".*\\.meta$"'
 
     # Only remove source files if not in dry-run mode
+    # IMPORTANT: Do NOT use --Remove-source-dirs as it deletes the _ready folder itself!
+    # We only want to delete individual files, not the parent directories
     if not dry_run:
-        mirror_opts += " --Remove-source-files --Remove-source-dirs"
+        mirror_opts += " --Remove-source-files"
 
     cmd += f'mirror {mirror_opts} --log="{lftp_log}" '
-    cmd += f'"{sb["remote_downloads"]}" "{paths["downloads_done"]}"\n'
+    cmd += f'"{sync_path}" "{paths["downloads_done"]}"\n'
     cmd += "quit\nEOF"
 
     return cmd
@@ -126,11 +236,29 @@ def sync_seedbox(config: dict, dry_run: bool = False) -> bool:
         with acquire_lock('seedbox_sync'):
             logger.info("Lock acquired, proceeding with sync")
 
-            # Build lftp command
-            lftp_cmd = build_lftp_command(config, dry_run)
+            # Check if remote directories have files before running lftp
+            logger.info("Checking remote directories for files...")
+            has_files, sync_path = check_remote_has_files(config, logger)
+
+            if not has_files:
+                logger.info("No files to sync from seedbox - all remote directories are empty")
+                logger.info("="*60)
+                logger.info("SEEDBOX SYNC COMPLETED (NO FILES TO SYNC)")
+                logger.info("="*60)
+
+                print("\n" + "="*60)
+                print("NO FILES TO SYNC")
+                print("="*60)
+                print("All remote directories are empty - nothing to download")
+                print("="*60 + "\n")
+
+                return True  # Success - empty directories are not an error
+
+            # Build lftp command with the discovered sync path
+            lftp_cmd = build_lftp_command(config, sync_path, dry_run)
 
             logger.info(f"Syncing from seedbox: {config['seedbox']['host']}")
-            logger.info(f"Remote: {config['seedbox']['remote_downloads']}")
+            logger.info(f"Remote: {sync_path}")
             logger.info(f"Local: {config['paths']['downloads_done']}")
 
             # Execute lftp with real-time output
