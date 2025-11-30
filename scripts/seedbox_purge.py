@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """Comprehensive seedbox and local cleanup with multi-phase purge strategy.
 
-This script performs intelligent cleanup across three phases:
+This script performs intelligent cleanup across four phases:
+
+Phase 0: Auto-Import (TMDB)
+  - Scan downloads/_done for unmanaged video files
+  - Parse filenames to extract title/year
+  - Fetch age ratings from TMDB (G, PG, PG-13, R, TV-Y, TV-PG, etc.)
+  - Route kids content (G, PG, TV-Y, TV-Y7, TV-G, TV-PG) to kids libraries
+  - Route adult content to standard libraries
+  - Import main videos and subtitles only (skip extras)
 
 Phase 1: Active Torrents (XMLRPC)
   - Delete torrents via rtorrent XMLRPC if imported + policy met
@@ -10,29 +18,38 @@ Phase 1: Active Torrents (XMLRPC)
 
 Phase 2: Remote /downloads Files (SSH)
   - Clean up orphaned files in seedbox /downloads directory
-  - Delete files that are imported to Radarr/Sonarr
-  - Handles files where torrent was removed but files remain
+  - Delete files that have been downloaded locally
+  - Delete extra files (trailers, samples, behind the scenes, txt, nfo, etc.)
+  - Keep main videos and subtitles that haven't been downloaded
 
 Phase 3: Local _done Files (Filesystem)
   - Clean up local downloads/_done after import to library
   - Delete files that exist in final Radarr/Sonarr library location
-  - Frees up space in staging directory
+  - Delete extra files (trailers, samples, behind the scenes, txt, nfo, etc.)
+  - Keep main videos and subtitles not yet imported
+
+File Classification:
+- VIDEO: Main movie/episode files (kept for import)
+- SUBTITLE: .srt, .sub, .ass files (kept for import)
+- EXTRA: Trailers, samples, behind the scenes, txt, nfo (always purged)
 
 Features:
 - Hash-based torrent matching (100% accurate)
-- Path-based file matching for orphaned files
+- Intelligent file classification (video/subtitle/extra)
+- Age rating-based library routing
 - Comprehensive cleanup across all storage layers
 - Dry-run mode for safety
 - Detailed logging and ntfy notifications
 
 Usage:
-    # Dry-run mode (shows what would be deleted)
+    # Dry-run mode (shows what would be deleted/imported)
     python3 scripts/seedbox_purge.py --dry-run --verbose
 
-    # Execute mode (actually delete)
+    # Execute mode (actually delete and import)
     python3 scripts/seedbox_purge.py --execute
 
     # Skip specific phases
+    python3 scripts/seedbox_purge.py --execute --skip-auto-import
     python3 scripts/seedbox_purge.py --execute --skip-torrents
     python3 scripts/seedbox_purge.py --execute --skip-remote-files
     python3 scripts/seedbox_purge.py --execute --skip-local-done
@@ -57,6 +74,92 @@ from utils.api_clients import RadarrAPI, SonarrAPI
 from utils.seedbox_ssh import SeedboxSSH
 from utils.tmdb_client import create_tmdb_client
 import re
+
+
+def classify_file(filepath: Path) -> str:
+    """Classify file as 'video', 'subtitle', or 'extra'.
+
+    Args:
+        filepath: Path to file
+
+    Returns:
+        'video', 'subtitle', or 'extra'
+
+    Examples:
+        >>> classify_file(Path('movie.mkv'))
+        'video'
+        >>> classify_file(Path('movie.en.srt'))
+        'subtitle'
+        >>> classify_file(Path('movie-trailer.mp4'))
+        'extra'
+        >>> classify_file(Path('movie-sample.mkv'))
+        'extra'
+    """
+    filename = filepath.name.lower()
+    stem = filepath.stem.lower()
+
+    # Subtitle extensions
+    subtitle_exts = {'.srt', '.sub', '.ass', '.ssa', '.vtt', '.idx', '.sup'}
+    if filepath.suffix.lower() in subtitle_exts:
+        return 'subtitle'
+
+    # Video extensions
+    video_exts = {'.mkv', '.mp4', '.avi', '.m4v', '.ts', '.mpg', '.mpeg', '.wmv', '.flv', '.mov'}
+    if filepath.suffix.lower() not in video_exts:
+        # Not a video file - classify as extra
+        return 'extra'
+
+    # Check for extra video patterns (trailers, samples, behind the scenes, etc.)
+    extra_patterns = [
+        r'[-_\.\s](trailer|preview|teaser|clip)s?[-_\.\s]',
+        r'[-_\.\s](sample|rarbg)[-_\.\s]',
+        r'[-_\.\s](behind\.?the\.?scenes?|bts|making\.?of)[-_\.\s]',
+        r'[-_\.\s](deleted\.?scenes?|extras?|bonus)[-_\.\s]',
+        r'[-_\.\s](featurette|interview|promo)[-_\.\s]',
+        r'[-_\.\s](proof|screener)[-_\.\s]',
+        r'^sample[-_\.]',
+        r'[-_\.]sample$',
+    ]
+
+    for pattern in extra_patterns:
+        if re.search(pattern, filename, re.IGNORECASE):
+            return 'extra'
+
+    # Check file size - videos under 100MB are likely samples/extras
+    try:
+        if filepath.exists():
+            size_mb = filepath.stat().st_size / (1024 * 1024)
+            if size_mb < 100:
+                return 'extra'
+    except:
+        pass
+
+    return 'video'
+
+
+def should_import_file(filepath: Path) -> bool:
+    """Determine if file should be imported to Radarr/Sonarr.
+
+    Args:
+        filepath: Path to file
+
+    Returns:
+        True if file should be imported (main video or subtitle)
+    """
+    classification = classify_file(filepath)
+    return classification in ('video', 'subtitle')
+
+
+def should_purge_file(filepath: Path) -> bool:
+    """Determine if file should be purged (extras, trailers, etc.).
+
+    Args:
+        filepath: Path to file
+
+    Returns:
+        True if file should be purged
+    """
+    return classify_file(filepath) == 'extra'
 
 
 def parse_media_filename(filename: str) -> Optional[Tuple[str, Optional[int], str]]:
@@ -192,14 +295,20 @@ def auto_import_files(
         logger.error(f"Failed to get Radarr/Sonarr configuration: {e}")
         return (0, 0)
 
-    # Scan for video files
+    # Scan for video files (excluding extras)
     video_extensions = {'.mkv', '.mp4', '.avi', '.m4v', '.ts', '.mpg', '.mpeg'}
-    video_files = []
+    all_video_files = []
 
     for ext in video_extensions:
-        video_files.extend(downloads_done.rglob(f'*{ext}'))
+        all_video_files.extend(downloads_done.rglob(f'*{ext}'))
 
-    logger.info(f"Found {len(video_files)} video files in {downloads_done}")
+    # Filter out extras (trailers, samples, behind the scenes, etc.)
+    video_files = [f for f in all_video_files if classify_file(f) == 'video']
+    extras_found = len(all_video_files) - len(video_files)
+
+    logger.info(f"Found {len(all_video_files)} total video files in {downloads_done}")
+    logger.info(f"  Main videos: {len(video_files)}")
+    logger.info(f"  Extras (skipped): {extras_found}")
 
     movies_imported = 0
     series_imported = 0
@@ -561,7 +670,14 @@ def purge_remote_files(
     dry_run: bool = False,
     verbose: bool = False
 ) -> Tuple[int, int]:
-    """Phase 2: Purge orphaned files in remote /downloads directory.
+    """Phase 2: Purge orphaned files and extras in remote /downloads directory.
+
+    Deletes:
+    1. Files that have been downloaded locally (orphaned remote copies)
+    2. Extra files (trailers, samples, behind the scenes, txt, nfo, etc.)
+
+    Keeps:
+    - Main video files and subtitles that haven't been downloaded yet
 
     Args:
         config: Configuration dictionary
@@ -579,6 +695,7 @@ def purge_remote_files(
     logger.info("="*60)
 
     deleted_count = 0
+    extras_deleted = 0
     total_size_deleted = 0
 
     # Connect to seedbox via SSH
@@ -609,23 +726,40 @@ def purge_remote_files(
                         logger.info(f"PROTECTED: {remote_path}")
                     continue
 
+                # Classify file
+                remote_pathobj = Path(remote_path)
+                classification = classify_file(remote_pathobj)
+
                 # Build local equivalent path
                 remote_rel = remote_path.replace(sb['remote_downloads'], '').lstrip('/')
                 local_path = os.path.join(config['paths']['downloads_done'], remote_rel)
+                local_exists = os.path.exists(local_path)
 
-                # Check if local file exists (meaning it was downloaded)
-                if not os.path.exists(local_path):
+                # Decision logic:
+                # 1. If it's an extra file, always delete
+                # 2. If it's a main video/subtitle, only delete if downloaded locally
+                should_delete = False
+                reason = ""
+
+                if classification == 'extra':
+                    should_delete = True
+                    reason = "extra file (trailer/sample/txt/nfo)"
+                    extras_deleted += 1
+                elif local_exists:
+                    should_delete = True
+                    reason = "downloaded locally"
+                else:
                     if verbose:
-                        logger.info(f"SKIP (not downloaded yet): {remote_path}")
+                        logger.info(f"KEEP (not downloaded yet): {remote_path} [{classification}]")
                     continue
 
-                # File exists locally, so it's safe to delete remote
+                # Delete the file
                 size_gb = file_size / (1024 ** 3)
 
                 if dry_run:
-                    logger.info(f"🗑️  [DRY-RUN] Would delete remote file: {remote_path} ({size_gb:.2f} GB)")
+                    logger.info(f"🗑️  [DRY-RUN] Would delete remote: {remote_path} ({size_gb:.2f} GB) - {reason}")
                 else:
-                    logger.info(f"🗑️  Deleting remote file: {remote_path} ({size_gb:.2f} GB)")
+                    logger.info(f"🗑️  Deleting remote: {remote_path} ({size_gb:.2f} GB) - {reason}")
                     try:
                         ssh.delete_file(remote_path)
                         logger.info("    ✅ Deleted successfully")
@@ -647,6 +781,8 @@ def purge_remote_files(
     logger.info("")
     logger.info(f"Phase 2 Summary:")
     logger.info(f"  Remote files deleted: {deleted_count}")
+    logger.info(f"    - Extras purged: {extras_deleted}")
+    logger.info(f"    - Downloaded locally: {deleted_count - extras_deleted}")
     logger.info(f"  Space freed: {total_size_deleted / (1024**3):.2f} GB")
 
     return deleted_count, total_size_deleted
@@ -659,7 +795,14 @@ def purge_local_done(
     dry_run: bool = False,
     verbose: bool = False
 ) -> Tuple[int, int]:
-    """Phase 3: Purge local _done files that are imported to library.
+    """Phase 3: Purge local _done files and extras.
+
+    Deletes:
+    1. Files that have been imported to Radarr/Sonarr library
+    2. Extra files (trailers, samples, behind the scenes, txt, nfo, etc.)
+
+    Keeps:
+    - Main video files and subtitles that haven't been imported yet
 
     Args:
         config: Configuration dictionary
@@ -677,6 +820,7 @@ def purge_local_done(
     logger.info("="*60)
 
     deleted_count = 0
+    extras_deleted = 0
     total_size_deleted = 0
 
     downloads_done = Path(config['paths']['downloads_done'])
@@ -692,30 +836,45 @@ def purge_local_done(
         if not item.is_file():
             continue
 
-        # Check if this file (or similar named file) exists in library
-        # This is a simple check - could be enhanced with fuzzy matching
+        # Classify file
+        classification = classify_file(item)
+
+        # Check if this file exists in library
         filename = item.name
         exists_in_library = any(filename in lib_path for lib_path in library_files)
 
-        if not exists_in_library:
+        # Decision logic:
+        # 1. If it's an extra file, always delete
+        # 2. If it's a main video/subtitle, only delete if in library
+        should_delete = False
+        reason = ""
+
+        if classification == 'extra':
+            should_delete = True
+            reason = "extra file (trailer/sample/txt/nfo)"
+            extras_deleted += 1
+        elif exists_in_library:
+            should_delete = True
+            reason = "imported to library"
+        else:
             if verbose:
-                logger.info(f"SKIP (not in library): {item}")
+                logger.info(f"KEEP (not in library): {item} [{classification}]")
             continue
 
-        # File exists in library, safe to delete from _done
-        size_gb = item.stat().st_size / (1024 ** 3)
+        # Delete the file
+        try:
+            size_gb = item.stat().st_size / (1024 ** 3)
 
-        if dry_run:
-            logger.info(f"🗑️  [DRY-RUN] Would delete local file: {item} ({size_gb:.2f} GB)")
-        else:
-            logger.info(f"🗑️  Deleting local file: {item} ({size_gb:.2f} GB)")
-            try:
+            if dry_run:
+                logger.info(f"🗑️  [DRY-RUN] Would delete local: {item} ({size_gb:.2f} GB) - {reason}")
+            else:
+                logger.info(f"🗑️  Deleting local: {item} ({size_gb:.2f} GB) - {reason}")
                 item.unlink()
                 logger.info("    ✅ Deleted successfully")
                 total_size_deleted += item.stat().st_size
                 deleted_count += 1
-            except Exception as e:
-                logger.error(f"    ❌ Failed to delete: {e}")
+        except Exception as e:
+            logger.error(f"    ❌ Failed to delete {item}: {e}")
 
     # Clean up empty directories
     if not dry_run and deleted_count > 0:
@@ -731,6 +890,8 @@ def purge_local_done(
     logger.info("")
     logger.info(f"Phase 3 Summary:")
     logger.info(f"  Local files deleted: {deleted_count}")
+    logger.info(f"    - Extras purged: {extras_deleted}")
+    logger.info(f"    - Imported to library: {deleted_count - extras_deleted}")
     logger.info(f"  Space freed: {total_size_deleted / (1024**3):.2f} GB")
 
     return deleted_count, total_size_deleted
