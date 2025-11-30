@@ -52,6 +52,16 @@ def build_lftp_command(config: dict, dry_run: bool = False) -> str:
     paths = config['paths']
     lftp = sb['lftp']
 
+    # Get project root directory (parent of scripts/)
+    project_root = Path(__file__).parent.parent
+
+    # Create logs directory relative to project root
+    logs_dir = project_root / 'logs'
+    logs_dir.mkdir(exist_ok=True)
+
+    # Build log file path relative to project
+    lftp_log = logs_dir / 'seedbox_sync_lftp.log'
+
     # Build lftp command
     cmd = f"""lftp -p {sb['port']} -u {sb['username']},{sb['password']} {sb['host']} << 'EOF'
 set ftp:ssl-allow {'yes' if lftp['ssl_allow'] else 'no'}
@@ -72,7 +82,7 @@ set xfer:temp-file-name *{lftp['temp_suffix']}
     if not dry_run:
         mirror_opts += " --Remove-source-files --Remove-source-dirs"
 
-    cmd += f'mirror {mirror_opts} --log="{paths["logs"]}/seedbox_sync_lftp.log" '
+    cmd += f'mirror {mirror_opts} --log="{lftp_log}" '
     cmd += f'"{sb["remote_downloads"]}" "{paths["downloads_done"]}"\n'
     cmd += "quit\nEOF"
 
