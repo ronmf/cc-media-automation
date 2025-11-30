@@ -104,13 +104,15 @@ def resort_movies(
         current_path = movie.get('path', '')
         certification = movie.get('certification', '')
 
-        # Determine current library
-        in_kids = kids_movies_path in current_path
-        in_adult = movies_path in current_path
+        # Determine current library by checking folder names
+        # More flexible than exact path matching
+        path_lower = current_path.lower()
+        in_kids = '/kids_movies/' in path_lower or path_lower.endswith('/kids_movies')
+        in_adult = ('/movies/' in path_lower or path_lower.endswith('/movies')) and not in_kids
 
-        # Skip if not in either library (shouldn't happen)
+        # Skip if not in either library
         if not in_kids and not in_adult:
-            logger.warning(f"SKIP: {title} ({year}) - not in known library: {current_path}")
+            logger.warning(f"SKIP: {title} ({year}) - not in movies or kids_movies: {current_path}")
             continue
 
         # Check if rating matches library
@@ -151,7 +153,10 @@ def resort_movies(
 
         # Move to kids
         for item in to_kids:
-            new_path = item['current_path'].replace(movies_path, kids_movies_path)
+            # Extract just the movie folder name
+            folder_name = Path(item['current_path']).name
+            new_path = str(Path(kids_movies_path) / folder_name)
+
             try:
                 radarr.update_movie(
                     item['id'],
@@ -163,7 +168,10 @@ def resort_movies(
 
         # Move to adult
         for item in to_adult:
-            new_path = item['current_path'].replace(kids_movies_path, movies_path)
+            # Extract just the movie folder name
+            folder_name = Path(item['current_path']).name
+            new_path = str(Path(movies_path) / folder_name)
+
             try:
                 radarr.update_movie(
                     item['id'],
@@ -222,13 +230,14 @@ def resort_series(
         current_path = show.get('path', '')
         certification = show.get('certification', '')
 
-        # Determine current library
-        in_kids = kids_series_path in current_path
-        in_adult = series_path in current_path
+        # Determine current library by checking folder names
+        path_lower = current_path.lower()
+        in_kids = '/kids_series/' in path_lower or path_lower.endswith('/kids_series')
+        in_adult = ('/series/' in path_lower or path_lower.endswith('/series')) and not in_kids
 
         # Skip if not in either library
         if not in_kids and not in_adult:
-            logger.warning(f"SKIP: {title} ({year}) - not in known library: {current_path}")
+            logger.warning(f"SKIP: {title} ({year}) - not in series or kids_series: {current_path}")
             continue
 
         # Check if rating matches library
@@ -269,7 +278,10 @@ def resort_series(
 
         # Move to kids
         for item in to_kids:
-            new_path = item['current_path'].replace(series_path, kids_series_path)
+            # Extract just the series folder name
+            folder_name = Path(item['current_path']).name
+            new_path = str(Path(kids_series_path) / folder_name)
+
             try:
                 sonarr.update_series(
                     item['id'],
@@ -281,7 +293,10 @@ def resort_series(
 
         # Move to adult
         for item in to_adult:
-            new_path = item['current_path'].replace(kids_series_path, series_path)
+            # Extract just the series folder name
+            folder_name = Path(item['current_path']).name
+            new_path = str(Path(series_path) / folder_name)
+
             try:
                 sonarr.update_series(
                     item['id'],
