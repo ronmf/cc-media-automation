@@ -52,7 +52,7 @@ Automated media server management suite for Servarr stack with seedbox integrati
 │
 ├── utils/                       # Shared modules
 │   ├── config_loader.py
-│   ├── api_clients.py          # ✨ ENHANCED: Radarr/Sonarr search/add/update methods
+│   ├── api_clients.py          # ✨ ENHANCED: Human-readable error messages
 │   ├── tmdb_client.py          # ✨ NEW: TMDB API client for age ratings
 │   ├── rtorrent_client.py       # ✨ NEW: XMLRPC client for rtorrent
 │   ├── ntfy_notifier.py
@@ -71,23 +71,34 @@ Automated media server management suite for Servarr stack with seedbox integrati
 
 ### High Priority
 1. **`seedbox_sync.py`** - Download from seedbox via lftp
-   - Remote: `/downloads` → Local: `/mnt/media/downloads/_done`
+   - **Multi-directory check** (priority order):
+     1. `/downloads/_ready` (completed torrents - primary)
+     2. `/downloads` (all files - fallback)
+   - Syncs from whichever directory has files
+   - Remote → Local: `/mnt/media/downloads/_done`
    - Remove source files after successful transfer
    - Clean up `*.lftp` temp files
 
 2. **`seedbox_purge.py`** - ✨ 4-Phase: Auto-Import + Cleanup
-   - **Phase 0 (Auto-Import)**: Parse unmanaged files → TMDB age rating → route to kids/adult libraries
+   - **Phase 0 (Auto-Import)**: DISABLED by default (let Radarr/Sonarr handle)
+     - Parse unmanaged files → TMDB age rating → route to kids/adult libraries
+     - Enable with `auto_import_enabled: true` in config.yaml
+     - See Troubleshooting section for setup details
    - **Phase 1 (XMLRPC)**: Delete torrents by hash matching (downloadId)
-   - **Phase 2 (SSH)**: Clean orphaned remote /downloads files
-   - **Phase 3 (Filesystem)**: Purge local _done staging files
+   - **Phase 2 (SSH)**: Clean orphaned remote files (aligned with sync directories)
+     - Checks same directories as seedbox_sync.py
+     - Avoids duplicate cleanup when fallback is parent of primary
+   - **Phase 3 (Filesystem)**: ✨ Purge local _done staging files
+     - **FIXED**: Now uses Radarr/Sonarr import history to detect imported files
+     - Matches by original filename using `droppedPath` from history API
+     - Works even after Radarr/Sonarr rename files in library
+     - Deletes confirmed imports and extras, keeps pending files
    - Policy: ratio >= 1.5 OR age >= 2 days
    - Kids content: G, PG, TV-Y, TV-Y7, TV-G, TV-PG → kids_movies/kids_series
    - Adult content: Everything else → movies/series
-   - 100% accurate hash-based matching
+   - 100% accurate hash-based matching (Phase 1) + history-based cleanup (Phase 3)
    - Monitor 750GB quota (warn at 700GB)
    - Flags: --skip-auto-import, --skip-torrents, --skip-remote-files, --skip-local-done
-
-   **Note**: For legacy SSH-only file cleanup, use `seedbox_file_cleanup.py`
 
 ### Medium Priority
 3. **`video_cleanup.py`** - Remove extras/trailers/samples
@@ -124,6 +135,31 @@ Automated media server management suite for Servarr stack with seedbox integrati
    - Log viewer, config display
    - "Run All" for daily tasks
 
+### Deprecated Scripts
+
+**`seedbox_file_cleanup.py`** - ⚠️ DEPRECATED
+   - Legacy SSH-based cleanup (single directory only)
+   - **Use instead**: `seedbox_purge.py --skip-auto-import --skip-torrents --skip-local-done`
+
+**Why deprecated?**
+
+| Feature | seedbox_file_cleanup.py (legacy) | seedbox_purge.py Phase 2 (current) |
+|---------|----------------------------------|-------------------------------------|
+| Multi-directory support | ❌ Single directory only | ✅ /_ready + /downloads fallback |
+| Library integration | ❌ Age-based only | ✅ Knows what's imported |
+| File classification | ❌ Deletes everything old | ✅ Keeps videos/subs not imported |
+| Hash matching | ❌ N/A | ✅ Matches active torrents |
+| Cleanup strategy | ❌ Simple age check | ✅ Integrated 4-phase approach |
+
+**Migration command:**
+```bash
+# Old (deprecated):
+python3 scripts/seedbox_file_cleanup.py --execute
+
+# New (recommended):
+python3 scripts/seedbox_purge.py --execute --skip-auto-import --skip-torrents --skip-local-done
+```
+
 ---
 
 ## Configuration
@@ -137,7 +173,7 @@ seedbox:
   port: 40685
   username: "ronz0"
   ssh_key: "/root/.ssh/id_rsa"
-  remote_downloads: "/downloads"
+  remote_downloads: "/downloads/_ready"
 
 paths:
   media_root: "/mnt/media"
@@ -376,7 +412,7 @@ python3 scripts/library_reducer.py --report reports/library_analysis_2025-11-29.
 ssh -p 40685 ronz0@185.56.20.18
 
 # Check remote files
-ssh -p 40685 ronz0@185.56.20.18 "ls -lah /downloads"
+ssh -p 40685 ronz0@185.56.20.18 "ls -lah /downloads/_ready"
 
 # Manual lftp test
 lftp -p 40685 -u ronz0 sftp://185.56.20.18
@@ -401,6 +437,76 @@ tail -f logs/seedbox_sync.log
 
 # View specific date
 grep "2025-11-29" logs/seedbox_sync.log
+```
+
+### Auto-Import Issues (Phase 0)
+
+**Auto-Import is DISABLED by default** (`auto_import_enabled: false` in config.yaml)
+
+**Why disabled?**
+- Radarr/Sonarr have built-in automatic import that works better
+- Auto-Import can fail with 400 errors if TMDB/TVDB lookups don't match exactly
+- Better to let the native *arr apps handle file detection and importing
+
+**Recommended approach:**
+
+1. **Configure Radarr/Sonarr Automatic Import:**
+   ```
+   Settings → Media Management → Importing
+   - Enable: "Use Hardlinks instead of Copy" (save disk space)
+   - Enable: "Import Extra Files" (subtitles, NFO, etc.)
+   - Monitor folder: /mnt/media/downloads/_done
+   ```
+
+2. **Let the workflow be:**
+   - `seedbox_sync.py` downloads to `_done`
+   - Radarr/Sonarr detect new files automatically
+   - Radarr/Sonarr import and organize to libraries
+   - `seedbox_purge.py` cleans up after import is confirmed
+
+**If you want to enable Auto-Import anyway:**
+
+1. Set `auto_import_enabled: true` in config.yaml
+2. Ensure TMDB API key is configured
+3. Run with dry-run first: `python3 scripts/seedbox_purge.py --dry-run`
+4. Check logs for 400 errors
+5. Common issues:
+   - Movie/series not found in Radarr/Sonarr lookup
+   - Year parsing incorrect from filename
+   - TVDB ID missing (series only)
+   - Filename parse failure (non-standard format)
+
+**Debugging 400 errors:**
+
+When Auto-Import fails with "400 Bad Request":
+```bash
+# Check detailed error logs (shows request payload)
+tail -f logs/seedbox_purge.log | grep -A 10 "400 Bad Request"
+
+# The log will show:
+# - URL: http://servarr.home:7878/api/v3/movie
+# - Method: POST
+# - Request JSON: {...}  # The payload sent to Radarr
+# - Response: {...}      # Error details from Radarr
+```
+
+Common causes:
+- **Missing TMDB ID**: Radarr lookup didn't return tmdbId
+- **Invalid year**: Parsed year doesn't match search results
+- **Duplicate entry**: Movie already in library (check by title)
+- **Root folder invalid**: Path doesn't match Radarr's configured root folders
+
+**Testing Auto-Import manually:**
+
+```bash
+# Dry-run (no actual import)
+python3 scripts/seedbox_purge.py --dry-run --skip-torrents --skip-remote-files --skip-local-done
+
+# Execute only Auto-Import phase
+python3 scripts/seedbox_purge.py --execute --skip-torrents --skip-remote-files --skip-local-done
+
+# Full purge with Auto-Import enabled
+python3 scripts/seedbox_purge.py --execute
 ```
 
 ---

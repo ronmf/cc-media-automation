@@ -17,14 +17,16 @@ Phase 1: Active Torrents (XMLRPC)
   - Policy: ratio >= min_ratio OR age >= min_days
 
 Phase 2: Remote /downloads Files (SSH)
-  - Clean up orphaned files in seedbox /downloads directory
+  - Clean up orphaned files in seedbox (aligned with seedbox_sync.py)
+  - Checks multiple directories: /_ready (primary), /downloads (fallback)
+  - Avoids duplicate cleanup when fallback is parent of primary
   - Delete files that have been imported to Radarr/Sonarr
   - Delete extra files (trailers, samples, behind the scenes, txt, nfo, etc.)
   - Keep main videos and subtitles not yet imported (lftp will download them)
 
 Phase 3: Local _done Files (Filesystem)
   - Clean up local downloads/_done after import to library
-  - Delete files that exist in final Radarr/Sonarr library location
+  - Delete files confirmed as imported via Radarr/Sonarr history (by original filename)
   - Delete extra files (trailers, samples, behind the scenes, txt, nfo, etc.)
   - Keep main videos and subtitles not yet imported
 
@@ -360,9 +362,10 @@ def auto_import_files(
 
             # Determine if kids content
             kids_ratings = config['thresholds']['kids_age_ratings']
+            rating_key = 'series' if content_type == 'series' else 'movies'
             is_kids = tmdb.is_kids_content(
                 title, year, content_type,
-                kids_ratings[content_type + 's' if content_type == 'series' else 'movies']
+                kids_ratings[rating_key]
             )
 
             # Determine root folder
@@ -379,14 +382,20 @@ def auto_import_files(
             if not dry_run:
                 try:
                     if content_type == 'movie':
-                        # Search TMDB for the movie
-                        search_results = tmdb.search_movie(title, year)
+                        # Use Radarr's search (returns proper TMDB metadata)
+                        search_results = radarr.search_movie(title, year)
                         if search_results:
-                            tmdb_id = search_results[0]['id']
+                            tmdb_id = search_results[0].get('tmdbId')
+                            if not tmdb_id:
+                                logger.warning(f"No TMDB ID in Radarr search results for: {title} ({year})")
+                                with lock:
+                                    failed += 1
+                                return 'failed'
+
                             radarr.add_movie(
                                 tmdb_id=tmdb_id,
                                 title=title,
-                                year=year or search_results[0].get('release_date', '')[:4],
+                                year=year or search_results[0].get('year', 0),
                                 quality_profile_id=quality_id,
                                 root_folder_path=root_folder,
                                 monitored=True,
@@ -396,19 +405,25 @@ def auto_import_files(
                                 movies_imported += 1
                             return 'imported'
                         else:
-                            logger.warning(f"Movie not found in TMDB: {title} ({year})")
+                            logger.warning(f"Movie not found in Radarr lookup: {title} ({year})")
                             with lock:
                                 failed += 1
                             return 'failed'
                     else:
-                        # Search TVDB for the series
-                        search_results = tmdb.search_tv(title, year)
+                        # Use Sonarr's search (returns proper TVDB metadata)
+                        search_results = sonarr.search_series(title, year)
                         if search_results:
-                            tvdb_id = search_results[0].get('id')  # TMDB TV ID
+                            tvdb_id = search_results[0].get('tvdbId')
+                            if not tvdb_id:
+                                logger.warning(f"No TVDB ID in Sonarr search results for: {title}")
+                                with lock:
+                                    failed += 1
+                                return 'failed'
+
                             sonarr.add_series(
                                 tvdb_id=tvdb_id,
                                 title=title,
-                                year=year or int(search_results[0].get('first_air_date', '')[:4]),
+                                year=year or int(search_results[0].get('year', 0)),
                                 quality_profile_id=quality_id,
                                 root_folder_path=root_folder,
                                 monitored=True,
@@ -418,7 +433,7 @@ def auto_import_files(
                                 series_imported += 1
                             return 'imported'
                         else:
-                            logger.warning(f"Series not found in TMDB: {title}")
+                            logger.warning(f"Series not found in Sonarr lookup: {title}")
                             with lock:
                                 failed += 1
                             return 'failed'
@@ -578,14 +593,26 @@ def get_imported_paths(radarr: RadarrAPI, sonarr: SonarrAPI, logger) -> Set[str]
             logger.info("Getting Sonarr library files...")
             series = sonarr._request('GET', '/api/v3/series')
             count = 0
+            seen_file_ids = set()  # Track already processed file IDs
 
             for show in series:
                 episodes = sonarr._request('GET', f"/api/v3/episode?seriesId={show['id']}")
                 for episode in episodes:
-                    if episode.get('hasFile'):
-                        with lock:
-                            library_files.add(episode['episodeFile']['path'])
-                        count += 1
+                    # Check if episode has a file and get the file ID
+                    if episode.get('hasFile') and 'episodeFileId' in episode:
+                        file_id = episode['episodeFileId']
+
+                        # Skip if we already processed this file (multiple episodes can share a file)
+                        if file_id in seen_file_ids:
+                            continue
+                        seen_file_ids.add(file_id)
+
+                        # Fetch full episode file details (like Radarr does)
+                        episode_file = sonarr._request('GET', f"/api/v3/episodefile/{file_id}")
+                        if episode_file and 'path' in episode_file:
+                            with lock:
+                                library_files.add(episode_file['path'])
+                            count += 1
 
             logger.info(f"Found {count} episode files in library")
 
@@ -603,6 +630,117 @@ def get_imported_paths(radarr: RadarrAPI, sonarr: SonarrAPI, logger) -> Set[str]
 
     logger.info(f"Total files in libraries: {len(library_files)}")
     return library_files
+
+
+def get_imported_done_files(radarr: RadarrAPI, sonarr: SonarrAPI, downloads_done: Path, logger) -> Set[str]:
+    """Get original filenames that were imported from the _done directory.
+
+    This function checks Radarr/Sonarr import history to find files that were
+    imported from the downloads_done directory, using the ORIGINAL filename
+    before Radarr/Sonarr renamed them.
+
+    Args:
+        radarr: Radarr API client
+        sonarr: Sonarr API client
+        downloads_done: Path to downloads_done directory
+        logger: Logger instance
+
+    Returns:
+        Set of original filenames that have been imported from _done
+    """
+    imported_files = set()
+    lock = threading.Lock()
+
+    # Convert downloads_done to string for path matching
+    done_path_str = str(downloads_done.resolve())
+
+    def get_radarr_imported():
+        """Get Radarr import history."""
+        try:
+            logger.info("Getting Radarr import history from _done...")
+            radarr_history = radarr._request(
+                'GET',
+                '/api/v3/history',
+                params={'eventType': 3, 'pageSize': 10000}
+            )
+
+            count = 0
+            if radarr_history and 'records' in radarr_history:
+                for record in radarr_history['records']:
+                    # Try droppedPath first (most reliable - full path)
+                    dropped_path = record.get('data', {}).get('droppedPath', '')
+
+                    # Check if this file came from _done directory
+                    if dropped_path and done_path_str in dropped_path:
+                        # Extract filename from dropped path
+                        filename = Path(dropped_path).name
+                        with lock:
+                            imported_files.add(filename)
+                        count += 1
+                    else:
+                        # Fallback to sourceTitle (may be just filename or release name)
+                        source_path = record.get('sourceTitle', '')
+                        if source_path and not os.path.isabs(source_path):
+                            # It's a filename, assume it came from _done
+                            filename = Path(source_path).name
+                            with lock:
+                                imported_files.add(filename)
+                            count += 1
+
+            logger.info(f"Found {count} Radarr imports from _done")
+
+        except Exception as e:
+            logger.warning(f"Could not get Radarr import history: {e}")
+
+    def get_sonarr_imported():
+        """Get Sonarr import history."""
+        try:
+            logger.info("Getting Sonarr import history from _done...")
+            sonarr_history = sonarr._request(
+                'GET',
+                '/api/v3/history',
+                params={'eventType': 3, 'pageSize': 10000}
+            )
+
+            count = 0
+            if sonarr_history and 'records' in sonarr_history:
+                for record in sonarr_history['records']:
+                    # Try droppedPath first (most reliable - full path)
+                    dropped_path = record.get('data', {}).get('droppedPath', '')
+
+                    # Check if this file came from _done directory
+                    if dropped_path and done_path_str in dropped_path:
+                        # Extract filename from dropped path
+                        filename = Path(dropped_path).name
+                        with lock:
+                            imported_files.add(filename)
+                        count += 1
+                    else:
+                        # Fallback to sourceTitle (may be just filename or release name)
+                        source_path = record.get('sourceTitle', '')
+                        if source_path and not os.path.isabs(source_path):
+                            # It's a filename, assume it came from _done
+                            filename = Path(source_path).name
+                            with lock:
+                                imported_files.add(filename)
+                            count += 1
+
+            logger.info(f"Found {count} Sonarr imports from _done")
+
+        except Exception as e:
+            logger.warning(f"Could not get Sonarr import history: {e}")
+
+    # Fetch in parallel
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(get_radarr_imported),
+            executor.submit(get_sonarr_imported)
+        ]
+        for future in as_completed(futures):
+            future.result()
+
+    logger.info(f"Total unique filenames imported from _done: {len(imported_files)}")
+    return imported_files
 
 
 def meets_policy(torrent: Dict, min_ratio: float, min_days: int) -> Tuple[bool, str]:
@@ -765,6 +903,10 @@ def purge_remote_files(
 ) -> Tuple[int, int]:
     """Phase 2: Purge orphaned files and extras in remote /downloads directory.
 
+    Checks multiple remote directories (aligned with seedbox_sync.py):
+    1. remote_downloads (_ready folder) - completed torrents
+    2. remote_downloads_fallback (/downloads parent) - all files
+
     Deletes:
     1. Files that have been imported to Radarr/Sonarr library
     2. Extra files (trailers, samples, behind the scenes, txt, nfo, etc.)
@@ -794,6 +936,38 @@ def purge_remote_files(
 
     # Connect to seedbox via SSH
     sb = config['seedbox']
+
+    # Collect directories to clean (aligned with seedbox_sync.py)
+    directories_to_clean = []
+
+    # Primary: /_ready (completed torrents)
+    if 'remote_downloads' in sb:
+        directories_to_clean.append({
+            'path': sb['remote_downloads'],
+            'description': 'completed torrents (_ready)'
+        })
+
+    # Fallback: /downloads (all downloads, avoid duplicates with _ready)
+    if 'remote_downloads_fallback' in sb:
+        fallback_path = sb['remote_downloads_fallback']
+        primary_path = sb.get('remote_downloads', '')
+
+        # Only add fallback if it's not a parent of primary
+        # (to avoid cleaning same files twice)
+        if not primary_path.startswith(fallback_path + '/'):
+            directories_to_clean.append({
+                'path': fallback_path,
+                'description': 'all downloads (including unfinished)'
+            })
+        else:
+            logger.info(f"Skipping fallback cleanup: {fallback_path} is parent of {primary_path}")
+
+    if not directories_to_clean:
+        logger.warning("No remote directories configured for cleanup")
+        return 0, 0
+
+    logger.info(f"Will clean {len(directories_to_clean)} remote directories")
+
     try:
         with SeedboxSSH(
             host=sb['host'],
@@ -803,70 +977,83 @@ def purge_remote_files(
         ) as ssh:
             logger.info(f"Connected to seedbox via SSH")
 
-            # List all files in /downloads (find command is recursive by default)
-            logger.info(f"Scanning {sb['remote_downloads']}...")
-            remote_files = ssh.list_files(sb['remote_downloads'])
-            logger.info(f"Found {len(remote_files)} files")
+            # Process each directory
+            for dir_info in directories_to_clean:
+                remote_path = dir_info['path']
+                description = dir_info['description']
 
-            # Check each file
-            for file_info in remote_files:
-                remote_path = file_info['path']
-                file_size = file_info['size']
+                logger.info("")
+                logger.info(f"Scanning {remote_path} ({description})...")
 
-                # Skip if in protected folder
-                protected = config['safety'].get('protected_folders', [])
-                if any(prot in remote_path for prot in protected):
-                    if verbose:
-                        logger.info(f"PROTECTED: {remote_path}")
+                # Check if directory exists
+                if not ssh.path_exists(remote_path):
+                    logger.info(f"  Directory does not exist: {remote_path}")
                     continue
 
-                # Classify file
-                remote_pathobj = Path(remote_path)
-                classification = classify_file(remote_pathobj)
+                # List all files in this directory
+                remote_files = ssh.list_files(remote_path)
+                logger.info(f"  Found {len(remote_files)} files")
 
-                # Check if file exists in Radarr/Sonarr library
-                filename = remote_pathobj.name
-                in_library = any(filename in lib_path for lib_path in library_files)
+                # Check each file in this directory
+                for file_info in remote_files:
+                    file_path = file_info['path']
+                    file_size = file_info['size']
 
-                # Decision logic:
-                # 1. If it's an extra file, always delete
-                # 2. If it's a main video/subtitle, only delete if imported to library
-                # 3. Keep main videos/subtitles not yet imported (lftp will download them)
-                should_delete = False
-                reason = ""
+                    # Skip if in protected folder
+                    protected = config['safety'].get('protected_folders', [])
+                    if any(prot in file_path for prot in protected):
+                        if verbose:
+                            logger.info(f"  PROTECTED: {file_path}")
+                        continue
 
-                if classification == 'extra':
-                    should_delete = True
-                    reason = "extra file (trailer/sample/txt/nfo)"
-                    extras_deleted += 1
-                elif in_library:
-                    should_delete = True
-                    reason = "imported to library"
-                else:
-                    if verbose:
-                        logger.info(f"KEEP (not imported, lftp will download): {remote_path} [{classification}]")
-                    continue
+                    # Classify file
+                    file_pathobj = Path(file_path)
+                    classification = classify_file(file_pathobj)
 
-                # Delete the file
-                size_gb = file_size / (1024 ** 3)
+                    # Check if file exists in Radarr/Sonarr library
+                    filename = file_pathobj.name
+                    in_library = any(filename in lib_path for lib_path in library_files)
 
-                if dry_run:
-                    logger.info(f"🗑️  [DRY-RUN] Would delete remote: {remote_path} ({size_gb:.2f} GB) - {reason}")
-                else:
-                    logger.info(f"🗑️  Deleting remote: {remote_path} ({size_gb:.2f} GB) - {reason}")
-                    try:
-                        ssh.delete_file(remote_path)
-                        logger.info("    ✅ Deleted successfully")
-                        total_size_deleted += file_size
-                        deleted_count += 1
-                    except Exception as e:
-                        logger.error(f"    ❌ Failed to delete: {e}")
+                    # Decision logic:
+                    # 1. If it's an extra file, always delete
+                    # 2. If it's a main video/subtitle, only delete if imported to library
+                    # 3. Keep main videos/subtitles not yet imported (lftp will download them)
+                    should_delete = False
+                    reason = ""
 
-            # Clean up empty directories
-            if not dry_run and deleted_count > 0:
-                logger.info("Cleaning up empty directories...")
-                empty_dirs = ssh.delete_empty_directories(sb['remote_downloads'])
-                logger.info(f"Removed {empty_dirs} empty directories")
+                    if classification == 'extra':
+                        should_delete = True
+                        reason = "extra file (trailer/sample/txt/nfo)"
+                        extras_deleted += 1
+                    elif in_library:
+                        should_delete = True
+                        reason = "imported to library"
+                    else:
+                        if verbose:
+                            logger.info(f"  KEEP (not imported, lftp will download): {file_path} [{classification}]")
+                        continue
+
+                    # Delete the file
+                    size_gb = file_size / (1024 ** 3)
+
+                    if dry_run:
+                        logger.info(f"  🗑️  [DRY-RUN] Would delete remote: {file_path} ({size_gb:.2f} GB) - {reason}")
+                    else:
+                        logger.info(f"  🗑️  Deleting remote: {file_path} ({size_gb:.2f} GB) - {reason}")
+                        try:
+                            ssh.delete_file(file_path)
+                            logger.info("      ✅ Deleted successfully")
+                            total_size_deleted += file_size
+                            deleted_count += 1
+                        except Exception as e:
+                            logger.error(f"      ❌ Failed to delete: {e}")
+
+                # Clean up empty directories in this path (respecting protected folders)
+                if not dry_run and deleted_count > 0:
+                    logger.info(f"  Cleaning up empty directories in {remote_path}...")
+                    protected = config['safety'].get('protected_folders', [])
+                    empty_dirs = ssh.delete_empty_directories(remote_path, exclude_paths=protected)
+                    logger.info(f"  Removed {empty_dirs} empty directories (protected folders preserved)")
 
     except Exception as e:
         logger.error(f"SSH connection error: {e}")
@@ -885,6 +1072,7 @@ def purge_remote_files(
 def purge_local_done(
     config: dict,
     library_files: Set[str],
+    imported_done_files: Set[str],
     logger,
     dry_run: bool = False,
     verbose: bool = False
@@ -892,15 +1080,23 @@ def purge_local_done(
     """Phase 3: Purge local _done files and extras.
 
     Deletes:
-    1. Files that have been imported to Radarr/Sonarr library
+    1. Files that have been imported to Radarr/Sonarr library (via history check)
     2. Extra files (trailers, samples, behind the scenes, txt, nfo, etc.)
+    3. Empty subdirectories after file cleanup
 
     Keeps:
     - Main video files and subtitles that haven't been imported yet
+    - The _done folder itself (NEVER DELETED)
+
+    CRITICAL PROTECTION:
+    - The downloads_done folder itself is NEVER deleted
+    - Only files and subdirectories within _done are cleaned
+    - Empty _done folder is preserved
 
     Args:
         config: Configuration dictionary
-        library_files: Set of file paths in Radarr/Sonarr libraries
+        library_files: Set of file paths in Radarr/Sonarr libraries (unused, kept for compatibility)
+        imported_done_files: Set of original filenames imported from _done (from history)
         logger: Logger instance
         dry_run: If True, don't actually delete
         verbose: If True, show all files
@@ -933,13 +1129,13 @@ def purge_local_done(
         # Classify file
         classification = classify_file(item)
 
-        # Check if this file exists in library
+        # Check if this file was imported from _done (via history)
         filename = item.name
-        exists_in_library = any(filename in lib_path for lib_path in library_files)
+        was_imported = filename in imported_done_files
 
         # Decision logic:
         # 1. If it's an extra file, always delete
-        # 2. If it's a main video/subtitle, only delete if in library
+        # 2. If it's a main video/subtitle, only delete if imported (confirmed via history)
         should_delete = False
         reason = ""
 
@@ -947,17 +1143,24 @@ def purge_local_done(
             should_delete = True
             reason = "extra file (trailer/sample/txt/nfo)"
             extras_deleted += 1
-        elif exists_in_library:
+        elif was_imported:
             should_delete = True
-            reason = "imported to library"
+            reason = "imported to library (confirmed via history)"
         else:
             if verbose:
-                logger.info(f"KEEP (not in library): {item} [{classification}]")
+                logger.info(f"KEEP (not imported yet): {item} [{classification}]")
             continue
 
         # Delete the file
         try:
-            size_gb = item.stat().st_size / (1024 ** 3)
+            # Check if file still exists (may have been deleted by Radarr/Sonarr during import)
+            if not item.exists():
+                if verbose:
+                    logger.info(f"Already deleted (likely imported by Radarr/Sonarr): {item}")
+                continue
+
+            size_bytes = item.stat().st_size
+            size_gb = size_bytes / (1024 ** 3)
 
             if dry_run:
                 logger.info(f"🗑️  [DRY-RUN] Would delete local: {item} ({size_gb:.2f} GB) - {reason}")
@@ -965,8 +1168,14 @@ def purge_local_done(
                 logger.info(f"🗑️  Deleting local: {item} ({size_gb:.2f} GB) - {reason}")
                 item.unlink()
                 logger.info("    ✅ Deleted successfully")
-                total_size_deleted += item.stat().st_size
+                total_size_deleted += size_bytes
                 deleted_count += 1
+        except FileNotFoundError:
+            # File was deleted between our check and deletion attempt
+            if verbose:
+                logger.info(f"Already deleted (race condition): {item}")
+        except PermissionError as e:
+            logger.error(f"    ❌ Permission denied: {item}: {e}")
         except Exception as e:
             logger.error(f"    ❌ Failed to delete {item}: {e}")
 
@@ -974,7 +1183,8 @@ def purge_local_done(
     if not dry_run and deleted_count > 0:
         logger.info("Cleaning up empty directories...")
         for dirpath in sorted(downloads_done.rglob('*'), reverse=True):
-            if dirpath.is_dir() and not any(dirpath.iterdir()):
+            # CRITICAL: NEVER delete the _done folder itself, only subdirectories within it
+            if dirpath != downloads_done and dirpath.is_dir() and not any(dirpath.iterdir()):
                 try:
                     dirpath.rmdir()
                     logger.info(f"Removed empty directory: {dirpath}")
@@ -1041,8 +1251,12 @@ def comprehensive_purge(config: dict, args) -> bool:
             # Get imported hashes (for Phase 1)
             imported_hashes = get_imported_hashes(radarr, sonarr, logger)
 
-            # Get library files (for Phase 3)
+            # Get library files (for Phase 2)
             library_files = get_imported_paths(radarr, sonarr, logger)
+
+            # Get imported filenames from _done (for Phase 3)
+            downloads_done = Path(config['paths']['downloads_done'])
+            imported_done_files = get_imported_done_files(radarr, sonarr, downloads_done, logger)
 
             logger.info("")
 
@@ -1100,7 +1314,7 @@ def comprehensive_purge(config: dict, args) -> bool:
             # Phase 3: Local _done cleanup
             if not args.skip_local_done:
                 deleted, size_freed = purge_local_done(
-                    config, library_files, logger,
+                    config, library_files, imported_done_files, logger,
                     dry_run=args.dry_run, verbose=args.verbose
                 )
                 total_deleted += deleted
@@ -1177,8 +1391,10 @@ Phase 1: Active Torrents (XMLRPC)
   - Policy: ratio >= 1.5 OR age >= 2 days
 
 Phase 2: Remote /downloads Files (SSH)
-  - Clean up orphaned files on seedbox
-  - Delete files that have been downloaded locally
+  - Clean up orphaned files on seedbox (aligned with seedbox_sync.py)
+  - Checks multiple directories: /_ready (primary), /downloads (fallback)
+  - Avoids duplicate cleanup when fallback is parent of primary
+  - Delete imported files and extras
 
 Phase 3: Local _done Files (Filesystem)
   - Clean up staging directory after import
