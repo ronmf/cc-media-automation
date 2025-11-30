@@ -73,6 +73,13 @@ class BaseAPI:
 
         for attempt in range(retries):
             try:
+                # Debug logging
+                self.logger.debug(f"{method} {url}")
+                if params:
+                    self.logger.debug(f"  Params: {params}")
+                if json:
+                    self.logger.debug(f"  JSON: {json}")
+
                 response = self.session.request(
                     method=method,
                     url=url,
@@ -92,10 +99,13 @@ class BaseAPI:
 
             except requests.exceptions.Timeout:
                 self.logger.warning(f"Request timeout (attempt {attempt + 1}/{retries})")
+                self.logger.warning(f"  URL: {url}")
+                self.logger.warning(f"  Params: {params}")
+                self.logger.warning(f"  Timeout: {self.timeout}s")
                 if attempt < retries - 1:
                     time.sleep(2 ** attempt)  # Exponential backoff
                 else:
-                    raise APIError(f"Request timed out after {retries} attempts")
+                    raise APIError(f"Request timed out after {retries} attempts: {url}")
 
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code in [401, 403]:

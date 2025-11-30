@@ -431,7 +431,13 @@ def check_prowlarr_availability(items: List[Dict], config: Dict, logger) -> List
         return items
 
     try:
-        prowlarr = ProwlarrAPI(config['prowlarr']['url'], config['prowlarr']['api_key'])
+        # Prowlarr searches can be slow, use longer timeout
+        prowlarr = ProwlarrAPI(
+            config['prowlarr']['url'],
+            config['prowlarr']['api_key'],
+            timeout=120  # 2 minutes for search operations
+        )
+        logger.info(f"Connecting to Prowlarr at {config['prowlarr']['url']}...")
         indexers = prowlarr.get_indexers()
         logger.info(f"Prowlarr: {len(indexers)} indexers available")
 
@@ -441,7 +447,13 @@ def check_prowlarr_availability(items: List[Dict], config: Dict, logger) -> List
             # Search for item
             try:
                 query = item['title']
+                logger.debug(f"[{idx}/{len(items)}] Searching Prowlarr for: '{query}'")
+
+                start_time = time.time()
                 results = prowlarr.search(query)
+                elapsed = time.time() - start_time
+
+                logger.debug(f"  → Search completed in {elapsed:.2f}s, found {len(results)} results")
 
                 # Count unique indexers with results
                 indexer_ids = set(r.get('indexerId') for r in results if r.get('indexerId'))
@@ -452,19 +464,26 @@ def check_prowlarr_availability(items: List[Dict], config: Dict, logger) -> List
                 if item['indexer_count'] < min_count and item['score'] > 0:
                     item['score'] = int(item['score'] * 0.7)  # Reduce score by 30%
                     item['reason'] += f" (rare: {item['indexer_count']} indexers)"
+                    logger.debug(f"  → Rare content: {item['indexer_count']} indexers, score reduced")
 
                 # Progress logging
-                if idx % 10 == 0:
+                if idx % 5 == 0:
                     logger.info(f"  Checked {idx}/{len(items)} items...")
 
                 # Rate limiting: wait 0.5 seconds between requests
                 time.sleep(0.5)
 
             except APIError as e:
-                logger.warning(f"Search failed for '{item['title']}': {e}")
+                logger.error(f"APIError searching '{item['title']}': {e}")
+                logger.error(f"  Error type: {type(e).__name__}")
+                logger.error(f"  Error details: {str(e)}")
                 item['indexer_count'] = 0
             except Exception as e:
-                logger.warning(f"Unexpected error searching '{item['title']}': {e}")
+                logger.error(f"Unexpected error searching '{item['title']}': {e}")
+                logger.error(f"  Error type: {type(e).__name__}")
+                logger.error(f"  Error details: {str(e)}")
+                import traceback
+                logger.error(f"  Traceback: {traceback.format_exc()}")
                 item['indexer_count'] = 0
 
         logger.info(f"Prowlarr check completed for {len(items)} items")
