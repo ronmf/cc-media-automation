@@ -98,12 +98,18 @@ def check_recent_imports(config: dict, since: datetime, logger) -> bool:
         logger.info("Checking Radarr for recent imports...")
         radarr = RadarrAPI(config['radarr']['url'], config['radarr']['api_key'])
 
-        # Get history events
-        history = radarr.get_history(event_type='downloadFolderImported')
+        # Get all recent history events (no filter, will filter client-side)
+        # Note: Radarr v3 API has changed eventType filtering
+        history = radarr.get_history()
 
-        # Filter for events since last check
+        # Filter for import events since last check
+        # eventType: 3 = DownloadFolderImported
         recent_events = []
         for event in history:
+            # Filter by event type (3 = DownloadFolderImported)
+            if event.get('eventType') != 'downloadFolderImported':
+                continue
+
             event_date = datetime.fromisoformat(event['date'].replace('Z', '+00:00'))
             if event_date.replace(tzinfo=None) > since:
                 recent_events.append(event)
@@ -125,12 +131,17 @@ def check_recent_imports(config: dict, since: datetime, logger) -> bool:
         logger.info("Checking Sonarr for recent imports...")
         sonarr = SonarrAPI(config['sonarr']['url'], config['sonarr']['api_key'])
 
-        # Get history events
-        history = sonarr.get_history(event_type='downloadFolderImported')
+        # Get all recent history events (no filter, will filter client-side)
+        # Note: Sonarr v3 API has changed eventType filtering
+        history = sonarr.get_history()
 
-        # Filter for events since last check
+        # Filter for import events since last check
         recent_events = []
         for event in history:
+            # Filter by event type (downloadFolderImported)
+            if event.get('eventType') != 'downloadFolderImported':
+                continue
+
             event_date = datetime.fromisoformat(event['date'].replace('Z', '+00:00'))
             if event_date.replace(tzinfo=None) > since:
                 recent_events.append(event)
