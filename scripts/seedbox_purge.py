@@ -18,9 +18,9 @@ Phase 1: Active Torrents (XMLRPC)
 
 Phase 2: Remote /downloads Files (SSH)
   - Clean up orphaned files in seedbox /downloads directory
-  - Delete files that have been downloaded locally
+  - Delete files that have been imported to Radarr/Sonarr
   - Delete extra files (trailers, samples, behind the scenes, txt, nfo, etc.)
-  - Keep main videos and subtitles that haven't been downloaded
+  - Keep main videos and subtitles not yet imported (lftp will download them)
 
 Phase 3: Local _done Files (Filesystem)
   - Clean up local downloads/_done after import to library
@@ -758,7 +758,7 @@ def purge_torrents(
 
 def purge_remote_files(
     config: dict,
-    imported_hashes: Set[str],
+    library_files: Set[str],
     logger,
     dry_run: bool = False,
     verbose: bool = False
@@ -766,15 +766,16 @@ def purge_remote_files(
     """Phase 2: Purge orphaned files and extras in remote /downloads directory.
 
     Deletes:
-    1. Files that have been downloaded locally (orphaned remote copies)
+    1. Files that have been imported to Radarr/Sonarr library
     2. Extra files (trailers, samples, behind the scenes, txt, nfo, etc.)
 
     Keeps:
-    - Main video files and subtitles that haven't been downloaded yet
+    - Main video files and subtitles that haven't been imported yet
+    - Files will be downloaded by lftp sync script
 
     Args:
         config: Configuration dictionary
-        imported_hashes: Set of imported torrent hashes
+        library_files: Set of file paths in Radarr/Sonarr libraries
         logger: Logger instance
         dry_run: If True, don't actually delete
         verbose: If True, show all files
@@ -823,14 +824,14 @@ def purge_remote_files(
                 remote_pathobj = Path(remote_path)
                 classification = classify_file(remote_pathobj)
 
-                # Build local equivalent path
-                remote_rel = remote_path.replace(sb['remote_downloads'], '').lstrip('/')
-                local_path = os.path.join(config['paths']['downloads_done'], remote_rel)
-                local_exists = os.path.exists(local_path)
+                # Check if file exists in Radarr/Sonarr library
+                filename = remote_pathobj.name
+                in_library = any(filename in lib_path for lib_path in library_files)
 
                 # Decision logic:
                 # 1. If it's an extra file, always delete
-                # 2. If it's a main video/subtitle, only delete if downloaded locally
+                # 2. If it's a main video/subtitle, only delete if imported to library
+                # 3. Keep main videos/subtitles not yet imported (lftp will download them)
                 should_delete = False
                 reason = ""
 
@@ -838,12 +839,12 @@ def purge_remote_files(
                     should_delete = True
                     reason = "extra file (trailer/sample/txt/nfo)"
                     extras_deleted += 1
-                elif local_exists:
+                elif in_library:
                     should_delete = True
-                    reason = "downloaded locally"
+                    reason = "imported to library"
                 else:
                     if verbose:
-                        logger.info(f"KEEP (not downloaded yet): {remote_path} [{classification}]")
+                        logger.info(f"KEEP (not imported, lftp will download): {remote_path} [{classification}]")
                     continue
 
                 # Delete the file
@@ -875,7 +876,7 @@ def purge_remote_files(
     logger.info(f"Phase 2 Summary:")
     logger.info(f"  Remote files deleted: {deleted_count}")
     logger.info(f"    - Extras purged: {extras_deleted}")
-    logger.info(f"    - Downloaded locally: {deleted_count - extras_deleted}")
+    logger.info(f"    - Imported to library: {deleted_count - extras_deleted}")
     logger.info(f"  Space freed: {total_size_deleted / (1024**3):.2f} GB")
 
     return deleted_count, total_size_deleted
@@ -1088,7 +1089,7 @@ def comprehensive_purge(config: dict, args) -> bool:
             # Phase 2: Remote file cleanup
             if not args.skip_remote_files:
                 deleted, size_freed = purge_remote_files(
-                    config, imported_hashes, logger,
+                    config, library_files, logger,
                     dry_run=args.dry_run, verbose=args.verbose
                 )
                 total_deleted += deleted
