@@ -61,6 +61,8 @@ import time
 import os
 from pathlib import Path
 from typing import Dict, Set, Tuple, List, Optional, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -310,12 +312,23 @@ def auto_import_files(
     logger.info(f"  Main videos: {len(video_files)}")
     logger.info(f"  Extras (skipped): {extras_found}")
 
+    if len(video_files) == 0:
+        return (0, 0)
+
+    logger.info(f"Processing {len(video_files)} files in parallel (max 5 workers)...")
+
     movies_imported = 0
     series_imported = 0
     skipped = 0
     failed = 0
 
-    for video_file in video_files:
+    # Thread-safe counters
+    lock = threading.Lock()
+
+    def process_video_file(video_file):
+        """Process a single video file (thread-safe)."""
+        nonlocal movies_imported, series_imported, skipped, failed
+
         try:
             # Parse filename
             parsed = parse_media_filename(video_file.name)
@@ -323,8 +336,9 @@ def auto_import_files(
             if not parsed:
                 if verbose:
                     logger.debug(f"Could not parse: {video_file.name}")
-                skipped += 1
-                continue
+                with lock:
+                    skipped += 1
+                return 'skipped'
 
             title, year, content_type = parsed
 
@@ -333,14 +347,16 @@ def auto_import_files(
                 if title.lower() in existing_movies:
                     if verbose:
                         logger.debug(f"Already in Radarr: {title} ({year})")
-                    skipped += 1
-                    continue
+                    with lock:
+                        skipped += 1
+                    return 'skipped'
             else:
                 if title.lower() in existing_series:
                     if verbose:
                         logger.debug(f"Already in Sonarr: {title}")
-                    skipped += 1
-                    continue
+                    with lock:
+                        skipped += 1
+                    return 'skipped'
 
             # Determine if kids content
             kids_ratings = config['thresholds']['kids_age_ratings']
@@ -352,11 +368,9 @@ def auto_import_files(
             # Determine root folder
             if content_type == 'movie':
                 root_folder = config['paths']['kids_movies'] if is_kids else config['paths']['movies']
-                api_client = radarr
                 quality_id = movie_quality_id
             else:
                 root_folder = config['paths']['kids_series'] if is_kids else config['paths']['series']
-                api_client = sonarr
                 quality_id = series_quality_id
 
             category = "kids" if is_kids else "adult"
@@ -378,17 +392,19 @@ def auto_import_files(
                                 monitored=True,
                                 search_on_add=True
                             )
-                            movies_imported += 1
+                            with lock:
+                                movies_imported += 1
+                            return 'imported'
                         else:
                             logger.warning(f"Movie not found in TMDB: {title} ({year})")
-                            failed += 1
+                            with lock:
+                                failed += 1
+                            return 'failed'
                     else:
                         # Search TVDB for the series
                         search_results = tmdb.search_tv(title, year)
                         if search_results:
                             tvdb_id = search_results[0].get('id')  # TMDB TV ID
-                            # Note: Sonarr uses TVDB ID, may need conversion
-                            # For now, try with TMDB ID
                             sonarr.add_series(
                                 tvdb_id=tvdb_id,
                                 title=title,
@@ -398,24 +414,43 @@ def auto_import_files(
                                 monitored=True,
                                 search_on_add=True
                             )
-                            series_imported += 1
+                            with lock:
+                                series_imported += 1
+                            return 'imported'
                         else:
                             logger.warning(f"Series not found in TMDB: {title}")
-                            failed += 1
+                            with lock:
+                                failed += 1
+                            return 'failed'
 
                 except Exception as e:
                     logger.error(f"Failed to import {title}: {e}")
-                    failed += 1
+                    with lock:
+                        failed += 1
+                    return 'failed'
             else:
-                if content_type == 'movie':
-                    movies_imported += 1
-                else:
-                    series_imported += 1
+                # Dry run
+                with lock:
+                    if content_type == 'movie':
+                        movies_imported += 1
+                    else:
+                        series_imported += 1
+                return 'dry_run'
 
         except Exception as e:
             logger.error(f"Error processing {video_file.name}: {e}")
-            failed += 1
-            continue
+            with lock:
+                failed += 1
+            return 'error'
+
+    # Process files in parallel
+    max_workers = min(5, len(video_files))  # Max 5 workers to avoid API rate limits
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_video_file, vf): vf for vf in video_files}
+
+        for future in as_completed(futures):
+            future.result()  # Wait for completion (errors already logged)
 
     # Summary
     logger.info("")
@@ -429,7 +464,7 @@ def auto_import_files(
 
 
 def get_imported_hashes(radarr: RadarrAPI, sonarr: SonarrAPI, logger) -> Set[str]:
-    """Get all imported torrent hashes from Radarr/Sonarr.
+    """Get all imported torrent hashes from Radarr/Sonarr (parallelized).
 
     Args:
         radarr: Radarr API client
@@ -440,55 +475,71 @@ def get_imported_hashes(radarr: RadarrAPI, sonarr: SonarrAPI, logger) -> Set[str
         Set of torrent hashes (lowercase for case-insensitive matching)
     """
     imported = set()
+    lock = threading.Lock()
 
-    # Get Radarr history (eventType=3 means "Downloaded/Imported")
-    logger.info("Getting Radarr import history...")
-    try:
-        radarr_history = radarr._request(
-            'GET',
-            '/api/v3/history',
-            params={'eventType': 3, 'pageSize': 1000}
-        )
+    def get_radarr_hashes():
+        """Get Radarr import history."""
+        try:
+            logger.info("Getting Radarr import history...")
+            radarr_history = radarr._request(
+                'GET',
+                '/api/v3/history',
+                params={'eventType': 3, 'pageSize': 1000}
+            )
 
-        if radarr_history and 'records' in radarr_history:
-            for record in radarr_history['records']:
-                download_id = record.get('downloadId', '').lower()
-                if download_id:
-                    imported.add(download_id)
+            count = 0
+            if radarr_history and 'records' in radarr_history:
+                for record in radarr_history['records']:
+                    download_id = record.get('downloadId', '').lower()
+                    if download_id:
+                        with lock:
+                            imported.add(download_id)
+                        count += 1
 
-        logger.info(f"Found {len([h for h in imported])} imported movies")
+            logger.info(f"Found {count} imported movies")
 
-    except Exception as e:
-        logger.warning(f"Could not get Radarr history: {e}")
+        except Exception as e:
+            logger.warning(f"Could not get Radarr history: {e}")
 
-    # Get Sonarr history
-    logger.info("Getting Sonarr import history...")
-    try:
-        sonarr_history = sonarr._request(
-            'GET',
-            '/api/v3/history',
-            params={'eventType': 3, 'pageSize': 1000}
-        )
+    def get_sonarr_hashes():
+        """Get Sonarr import history."""
+        try:
+            logger.info("Getting Sonarr import history...")
+            sonarr_history = sonarr._request(
+                'GET',
+                '/api/v3/history',
+                params={'eventType': 3, 'pageSize': 1000}
+            )
 
-        initial_count = len(imported)
+            count = 0
+            if sonarr_history and 'records' in sonarr_history:
+                for record in sonarr_history['records']:
+                    download_id = record.get('downloadId', '').lower()
+                    if download_id:
+                        with lock:
+                            imported.add(download_id)
+                        count += 1
 
-        if sonarr_history and 'records' in sonarr_history:
-            for record in sonarr_history['records']:
-                download_id = record.get('downloadId', '').lower()
-                if download_id:
-                    imported.add(download_id)
+            logger.info(f"Found {count} imported episodes")
 
-        logger.info(f"Found {len(imported) - initial_count} imported episodes")
+        except Exception as e:
+            logger.warning(f"Could not get Sonarr history: {e}")
 
-    except Exception as e:
-        logger.warning(f"Could not get Sonarr history: {e}")
+    # Fetch in parallel
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(get_radarr_hashes),
+            executor.submit(get_sonarr_hashes)
+        ]
+        for future in as_completed(futures):
+            future.result()
 
     logger.info(f"Total unique imported hashes: {len(imported)}")
     return imported
 
 
 def get_imported_paths(radarr: RadarrAPI, sonarr: SonarrAPI, logger) -> Set[str]:
-    """Get all imported media file paths from Radarr/Sonarr libraries.
+    """Get all imported media file paths from Radarr/Sonarr libraries (parallelized).
 
     Args:
         radarr: Radarr API client
@@ -499,37 +550,58 @@ def get_imported_paths(radarr: RadarrAPI, sonarr: SonarrAPI, logger) -> Set[str]
         Set of file paths in library (for checking if imports are complete)
     """
     library_files = set()
+    lock = threading.Lock()
 
-    # Get Radarr movies
-    logger.info("Getting Radarr library files...")
-    try:
-        movies = radarr._request('GET', '/api/v3/movie')
-        for movie in movies:
-            if movie.get('hasFile'):
-                movie_file = radarr._request('GET', f"/api/v3/moviefile/{movie['movieFile']['id']}")
-                if movie_file:
-                    library_files.add(movie_file['path'])
+    def get_radarr_paths():
+        """Get Radarr library file paths."""
+        try:
+            logger.info("Getting Radarr library files...")
+            movies = radarr._request('GET', '/api/v3/movie')
+            count = 0
 
-        logger.info(f"Found {len([f for f in library_files if f])} movie files in library")
+            for movie in movies:
+                if movie.get('hasFile'):
+                    movie_file = radarr._request('GET', f"/api/v3/moviefile/{movie['movieFile']['id']}")
+                    if movie_file:
+                        with lock:
+                            library_files.add(movie_file['path'])
+                        count += 1
 
-    except Exception as e:
-        logger.warning(f"Could not get Radarr library: {e}")
+            logger.info(f"Found {count} movie files in library")
 
-    # Get Sonarr episodes
-    logger.info("Getting Sonarr library files...")
-    try:
-        series = sonarr._request('GET', '/api/v3/series')
-        for show in series:
-            episodes = sonarr._request('GET', f"/api/v3/episode?seriesId={show['id']}")
-            for episode in episodes:
-                if episode.get('hasFile'):
-                    library_files.add(episode['episodeFile']['path'])
+        except Exception as e:
+            logger.warning(f"Could not get Radarr library: {e}")
 
-        logger.info(f"Found {len(library_files)} total files in libraries")
+    def get_sonarr_paths():
+        """Get Sonarr library file paths."""
+        try:
+            logger.info("Getting Sonarr library files...")
+            series = sonarr._request('GET', '/api/v3/series')
+            count = 0
 
-    except Exception as e:
-        logger.warning(f"Could not get Sonarr library: {e}")
+            for show in series:
+                episodes = sonarr._request('GET', f"/api/v3/episode?seriesId={show['id']}")
+                for episode in episodes:
+                    if episode.get('hasFile'):
+                        with lock:
+                            library_files.add(episode['episodeFile']['path'])
+                        count += 1
 
+            logger.info(f"Found {count} episode files in library")
+
+        except Exception as e:
+            logger.warning(f"Could not get Sonarr library: {e}")
+
+    # Fetch in parallel
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(get_radarr_paths),
+            executor.submit(get_sonarr_paths)
+        ]
+        for future in as_completed(futures):
+            future.result()
+
+    logger.info(f"Total files in libraries: {len(library_files)}")
     return library_files
 
 
@@ -574,7 +646,7 @@ def purge_torrents(
     dry_run: bool = False,
     verbose: bool = False
 ) -> Tuple[int, int]:
-    """Phase 1: Purge active torrents via XMLRPC.
+    """Phase 1: Purge active torrents via XMLRPC (parallelized).
 
     Args:
         config: Configuration dictionary
@@ -588,7 +660,7 @@ def purge_torrents(
         Tuple of (deleted_count, total_size_deleted_bytes)
     """
     logger.info("="*60)
-    logger.info("PHASE 1: ACTIVE TORRENT CLEANUP (XMLRPC)")
+    logger.info("PHASE 1: ACTIVE TORRENT CLEANUP (XMLRPC - PARALLELIZED)")
     logger.info("="*60)
 
     min_ratio = config['thresholds'].get('seedbox_min_ratio', 1.5)
@@ -599,6 +671,9 @@ def purge_torrents(
     not_imported_count = 0
     total_size_deleted = 0
 
+    # Thread-safe counters
+    lock = threading.Lock()
+
     # Get seeding torrents
     try:
         seeding_hashes = rtorrent.get_seeding_torrents()
@@ -607,51 +682,69 @@ def purge_torrents(
         logger.error(f"Failed to get seeding torrents: {e}")
         return 0, 0
 
-    # Process each torrent
-    for hash_id in seeding_hashes:
-        if hash_id.lower() not in imported_hashes:
-            if verbose:
-                logger.info(f"⏭️  SKIP (not imported): {hash_id[:8]}...")
-            not_imported_count += 1
-            continue
+    # Filter to only imported torrents
+    imported_seeding = [h for h in seeding_hashes if h.lower() in imported_hashes]
+    not_imported_count = len(seeding_hashes) - len(imported_seeding)
 
-        # Get torrent info
+    if verbose:
+        logger.info(f"Skipping {not_imported_count} torrents (not imported)")
+
+    logger.info(f"Processing {len(imported_seeding)} imported torrents in parallel (max 10 workers)...")
+
+    def process_torrent(hash_id):
+        """Process a single torrent (thread-safe)."""
+        nonlocal deleted_count, kept_count, total_size_deleted
+
         try:
+            # Get torrent info
             torrent = rtorrent.get_torrent_info(hash_id)
-        except Exception as e:
-            logger.warning(f"Could not get info for {hash_id}: {e}")
-            continue
 
-        # Check policy
-        should_delete, reason = meets_policy(torrent, min_ratio, min_days)
+            # Check policy
+            should_delete, reason = meets_policy(torrent, min_ratio, min_days)
 
-        if should_delete:
-            size_gb = torrent['size_bytes'] / (1024 ** 3)
+            if should_delete:
+                size_gb = torrent['size_bytes'] / (1024 ** 3)
 
-            if dry_run:
-                logger.info(
-                    f"🗑️  [DRY-RUN] Would delete torrent: {torrent['name']}\n"
-                    f"    Reason: {reason}\n"
-                    f"    Size: {size_gb:.2f} GB"
-                )
+                if dry_run:
+                    logger.info(
+                        f"🗑️  [DRY-RUN] Would delete: {torrent['name']}\n"
+                        f"    Reason: {reason}, Size: {size_gb:.2f} GB"
+                    )
+                else:
+                    logger.info(f"🗑️  Deleting: {torrent['name']} ({reason}, {size_gb:.2f} GB)")
+                    try:
+                        rtorrent.delete_torrent(hash_id, delete_files=True)
+                        logger.info(f"    ✅ Deleted: {torrent['name']}")
+                        with lock:
+                            total_size_deleted += torrent['size_bytes']
+                    except Exception as e:
+                        logger.error(f"    ❌ Failed to delete {torrent['name']}: {e}")
+                        return False
+
+                with lock:
+                    deleted_count += 1
+                return True
             else:
-                logger.info(
-                    f"🗑️  Deleting torrent: {torrent['name']}\n"
-                    f"    Reason: {reason}\n"
-                    f"    Size: {size_gb:.2f} GB"
-                )
-                try:
-                    rtorrent.delete_torrent(hash_id, delete_files=True)
-                    logger.info("    ✅ Deleted successfully")
-                    total_size_deleted += torrent['size_bytes']
-                except Exception as e:
-                    logger.error(f"    ❌ Failed to delete: {e}")
+                if verbose:
+                    logger.info(f"✅ KEEP: {torrent['name']} ({reason})")
+                with lock:
+                    kept_count += 1
+                return False
 
-            deleted_count += 1
-        else:
-            if verbose:
-                logger.info(f"✅ KEEP torrent: {torrent['name']} ({reason})")
-            kept_count += 1
+        except Exception as e:
+            logger.warning(f"Could not process {hash_id[:8]}: {e}")
+            return False
+
+    # Process torrents in parallel
+    max_workers = min(10, len(imported_seeding))  # Max 10 concurrent connections
+
+    if max_workers > 0:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(process_torrent, hash_id): hash_id
+                      for hash_id in imported_seeding}
+
+            for future in as_completed(futures):
+                future.result()  # Wait for completion (errors already logged)
 
     logger.info("")
     logger.info(f"Phase 1 Summary:")
