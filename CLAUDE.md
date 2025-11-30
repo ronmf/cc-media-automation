@@ -146,6 +146,7 @@ jellyfin:
 notifications:
   ntfy:
     url: "https://ntfy.les7nains.com/topic_default"
+    token: ""  # Optional: Bearer token for authenticated topics
 
 thresholds:
   seedbox_age_days: 2          # Torrent age threshold (OR condition)

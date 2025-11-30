@@ -15,10 +15,11 @@ import logging
 
 
 class NtfyNotifier:
-    """ntfy.sh notification client.
+    """ntfy.sh notification client with optional token authentication.
 
     Attributes:
         url: ntfy.sh topic URL
+        token: Optional bearer token for authentication
         priority: Default priority level
         tags: Default tags for notifications
         enabled: Whether notifications are enabled
@@ -37,6 +38,7 @@ class NtfyNotifier:
             >>> notifier = NtfyNotifier(config)
         """
         self.url = config.get('url', '')
+        self.token = config.get('token', '')  # Optional bearer token
         self.priority = config.get('priority', 'default')
         self.tags = config.get('tags', ['servarr'])
         self.enabled = config.get('enabled', True)
@@ -82,6 +84,10 @@ class NtfyNotifier:
             'Priority': priority or self.priority,
             'Tags': ','.join(tags or self.tags)
         }
+
+        # Add bearer token authentication if provided
+        if self.token:
+            headers['Authorization'] = f'Bearer {self.token}'
 
         # Add actions if provided
         if actions:
@@ -271,6 +277,7 @@ if __name__ == '__main__':
     # Test configuration
     test_config = {
         'url': 'https://ntfy.les7nains.com/topic_default',
+        'token': '',  # Optional: 'tk_xxxxx' for authenticated topics
         'enabled': True,
         'priority': 'default',
         'tags': ['servarr', 'test'],
