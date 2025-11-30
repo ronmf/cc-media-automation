@@ -55,6 +55,268 @@ from utils.validators import acquire_lock
 from utils.rtorrent_client import RTorrentClient
 from utils.api_clients import RadarrAPI, SonarrAPI
 from utils.seedbox_ssh import SeedboxSSH
+from utils.tmdb_client import create_tmdb_client
+import re
+
+
+def parse_media_filename(filename: str) -> Optional[Tuple[str, Optional[int], str]]:
+    """Parse media filename to extract title, year, and content type.
+
+    Args:
+        filename: Filename to parse (e.g., 'The.Lion.King.1994.1080p.BluRay.mkv')
+
+    Returns:
+        Tuple of (title, year, content_type) or None if parsing fails
+        content_type is either 'movie' or 'series'
+
+    Example:
+        >>> parse_media_filename('The.Lion.King.1994.1080p.BluRay.mkv')
+        ('The Lion King', 1994, 'movie')
+        >>> parse_media_filename('Breaking.Bad.S01E01.720p.mkv')
+        ('Breaking Bad', None, 'series')
+    """
+    # Remove file extension
+    name = Path(filename).stem
+
+    # Detect series (S01E01, s01e01, 1x01 patterns)
+    series_patterns = [
+        r'[Ss]\d{1,2}[Ee]\d{1,2}',  # S01E01
+        r'\d{1,2}x\d{1,2}',           # 1x01
+        r'Season\s*\d+',              # Season 1
+    ]
+
+    is_series = any(re.search(pattern, name) for pattern in series_patterns)
+    content_type = 'series' if is_series else 'movie'
+
+    # Remove quality tags
+    quality_tags = r'(1080p|720p|480p|2160p|4K|BluRay|WEB-DL|HDTV|WEBRip|DVDRip|x264|x265|HEVC|AAC|AC3|DTS|' \
+                   r'PROPER|REPACK|EXTENDED|UNRATED|DC|Directors\.Cut|xvid|divx)'
+    name = re.sub(quality_tags, ' ', name, flags=re.IGNORECASE)
+
+    # Remove release group tags (usually in brackets or after dash)
+    name = re.sub(r'\[.*?\]', ' ', name)  # [RELEASE]
+    name = re.sub(r'-[A-Z0-9]+$', ' ', name)  # -SPARKS
+
+    # Extract year (4 digits)
+    year_match = re.search(r'\b(19\d{2}|20\d{2})\b', name)
+    year = int(year_match.group(1)) if year_match else None
+
+    # Remove year from title
+    if year:
+        name = name.replace(str(year), ' ')
+
+    # For series, remove season/episode info
+    if is_series:
+        for pattern in series_patterns:
+            name = re.sub(pattern, ' ', name, flags=re.IGNORECASE)
+
+    # Clean up title
+    title = name.replace('.', ' ').replace('_', ' ')
+    title = re.sub(r'\s+', ' ', title).strip()
+
+    if not title:
+        return None
+
+    return (title, year, content_type)
+
+
+def auto_import_files(
+    config: Dict[str, Any],
+    radarr: RadarrAPI,
+    sonarr: SonarrAPI,
+    tmdb,
+    logger,
+    dry_run: bool = True,
+    verbose: bool = False
+) -> Tuple[int, int]:
+    """Auto-import unmanaged files to Radarr/Sonarr with age rating detection.
+
+    Scans local _done directory for files not yet in libraries, determines
+    if content is for kids based on age rating, and adds to appropriate
+    Radarr/Sonarr instance with correct root folder.
+
+    Args:
+        config: Configuration dictionary
+        radarr: Radarr API client
+        sonarr: Sonarr API client
+        tmdb: TMDB API client (or None if not configured)
+        logger: Logger instance
+        dry_run: If True, don't actually import
+        verbose: Show detailed information
+
+    Returns:
+        Tuple of (movies_imported, series_imported)
+    """
+    logger.info("")
+    logger.info("="*60)
+    logger.info("PHASE 0: AUTO-IMPORT UNMANAGED FILES")
+    logger.info("="*60)
+
+    if not config['thresholds'].get('auto_import_enabled', True):
+        logger.info("Auto-import disabled in configuration")
+        return (0, 0)
+
+    if not tmdb:
+        logger.warning("TMDB client not configured, auto-import disabled")
+        logger.info("Get a free API key from https://www.themoviedb.org/settings/api")
+        return (0, 0)
+
+    downloads_done = Path(config['paths']['downloads_done'])
+
+    if not downloads_done.exists():
+        logger.warning(f"Downloads directory not found: {downloads_done}")
+        return (0, 0)
+
+    # Get existing movies and series
+    existing_movies = {m['title'].lower(): m for m in radarr.get_movies()}
+    existing_series = {s['title'].lower(): s for s in sonarr.get_series()}
+
+    # Get quality profiles and root folders
+    try:
+        movie_profiles = radarr.get_quality_profiles()
+        series_profiles = sonarr.get_quality_profiles()
+        movie_folders = radarr.get_root_folders()
+        series_folders = sonarr.get_root_folders()
+
+        if not movie_profiles or not series_profiles:
+            logger.error("No quality profiles found in Radarr/Sonarr")
+            return (0, 0)
+
+        # Use first quality profile by default
+        movie_quality_id = movie_profiles[0]['id']
+        series_quality_id = series_profiles[0]['id']
+
+        logger.info(f"Using quality profile: {movie_profiles[0]['name']} (ID: {movie_quality_id})")
+
+    except Exception as e:
+        logger.error(f"Failed to get Radarr/Sonarr configuration: {e}")
+        return (0, 0)
+
+    # Scan for video files
+    video_extensions = {'.mkv', '.mp4', '.avi', '.m4v', '.ts', '.mpg', '.mpeg'}
+    video_files = []
+
+    for ext in video_extensions:
+        video_files.extend(downloads_done.rglob(f'*{ext}'))
+
+    logger.info(f"Found {len(video_files)} video files in {downloads_done}")
+
+    movies_imported = 0
+    series_imported = 0
+    skipped = 0
+    failed = 0
+
+    for video_file in video_files:
+        try:
+            # Parse filename
+            parsed = parse_media_filename(video_file.name)
+
+            if not parsed:
+                if verbose:
+                    logger.debug(f"Could not parse: {video_file.name}")
+                skipped += 1
+                continue
+
+            title, year, content_type = parsed
+
+            # Check if already in library
+            if content_type == 'movie':
+                if title.lower() in existing_movies:
+                    if verbose:
+                        logger.debug(f"Already in Radarr: {title} ({year})")
+                    skipped += 1
+                    continue
+            else:
+                if title.lower() in existing_series:
+                    if verbose:
+                        logger.debug(f"Already in Sonarr: {title}")
+                    skipped += 1
+                    continue
+
+            # Determine if kids content
+            kids_ratings = config['thresholds']['kids_age_ratings']
+            is_kids = tmdb.is_kids_content(
+                title, year, content_type,
+                kids_ratings[content_type + 's' if content_type == 'series' else 'movies']
+            )
+
+            # Determine root folder
+            if content_type == 'movie':
+                root_folder = config['paths']['kids_movies'] if is_kids else config['paths']['movies']
+                api_client = radarr
+                quality_id = movie_quality_id
+            else:
+                root_folder = config['paths']['kids_series'] if is_kids else config['paths']['series']
+                api_client = sonarr
+                quality_id = series_quality_id
+
+            category = "kids" if is_kids else "adult"
+            logger.info(f"📥 Importing {content_type}: {title} ({year}) [{category}] → {root_folder}")
+
+            if not dry_run:
+                try:
+                    if content_type == 'movie':
+                        # Search TMDB for the movie
+                        search_results = tmdb.search_movie(title, year)
+                        if search_results:
+                            tmdb_id = search_results[0]['id']
+                            radarr.add_movie(
+                                tmdb_id=tmdb_id,
+                                title=title,
+                                year=year or search_results[0].get('release_date', '')[:4],
+                                quality_profile_id=quality_id,
+                                root_folder_path=root_folder,
+                                monitored=True,
+                                search_on_add=True
+                            )
+                            movies_imported += 1
+                        else:
+                            logger.warning(f"Movie not found in TMDB: {title} ({year})")
+                            failed += 1
+                    else:
+                        # Search TVDB for the series
+                        search_results = tmdb.search_tv(title, year)
+                        if search_results:
+                            tvdb_id = search_results[0].get('id')  # TMDB TV ID
+                            # Note: Sonarr uses TVDB ID, may need conversion
+                            # For now, try with TMDB ID
+                            sonarr.add_series(
+                                tvdb_id=tvdb_id,
+                                title=title,
+                                year=year or int(search_results[0].get('first_air_date', '')[:4]),
+                                quality_profile_id=quality_id,
+                                root_folder_path=root_folder,
+                                monitored=True,
+                                search_on_add=True
+                            )
+                            series_imported += 1
+                        else:
+                            logger.warning(f"Series not found in TMDB: {title}")
+                            failed += 1
+
+                except Exception as e:
+                    logger.error(f"Failed to import {title}: {e}")
+                    failed += 1
+            else:
+                if content_type == 'movie':
+                    movies_imported += 1
+                else:
+                    series_imported += 1
+
+        except Exception as e:
+            logger.error(f"Error processing {video_file.name}: {e}")
+            failed += 1
+            continue
+
+    # Summary
+    logger.info("")
+    logger.info(f"Movies imported: {movies_imported}")
+    logger.info(f"Series imported: {series_imported}")
+    logger.info(f"Skipped (already in library): {skipped}")
+    logger.info(f"Failed: {failed}")
+    logger.info(f"Total processed: {len(video_files)}")
+
+    return (movies_imported, series_imported)
 
 
 def get_imported_hashes(radarr: RadarrAPI, sonarr: SonarrAPI, logger) -> Set[str]:
@@ -518,6 +780,9 @@ def comprehensive_purge(config: dict, args) -> bool:
                 config['sonarr']['api_key']
             )
 
+            # Initialize TMDB client (optional, for auto-import)
+            tmdb = create_tmdb_client(config)
+
             # Get imported hashes (for Phase 1)
             imported_hashes = get_imported_hashes(radarr, sonarr, logger)
 
@@ -527,8 +792,21 @@ def comprehensive_purge(config: dict, args) -> bool:
             logger.info("")
 
             # Track totals
+            total_imported_movies = 0
+            total_imported_series = 0
             total_deleted = 0
             total_size_freed = 0
+
+            # Phase 0: Auto-import unmanaged files
+            if not args.skip_auto_import:
+                movies_imported, series_imported = auto_import_files(
+                    config, radarr, sonarr, tmdb, logger,
+                    dry_run=args.dry_run, verbose=args.verbose
+                )
+                total_imported_movies += movies_imported
+                total_imported_series += series_imported
+            else:
+                logger.info("⏭️  SKIPPING Phase 0: Auto-import")
 
             # Phase 1: Torrent cleanup
             if not args.skip_torrents:
@@ -580,6 +858,10 @@ def comprehensive_purge(config: dict, args) -> bool:
             logger.info("="*60)
             logger.info("FINAL SUMMARY")
             logger.info("="*60)
+            if total_imported_movies > 0 or total_imported_series > 0:
+                logger.info(f"Total movies imported: {total_imported_movies}")
+                logger.info(f"Total series imported: {total_imported_series}")
+                logger.info("")
             logger.info(f"Total items deleted: {total_deleted}")
             logger.info(f"Total space freed: {total_size_freed / (1024**3):.2f} GB")
 
@@ -589,15 +871,20 @@ def comprehensive_purge(config: dict, args) -> bool:
                 logger.info("   python3 scripts/seedbox_purge.py --execute")
 
             # Success notification
-            if total_deleted > 0 and not args.dry_run:
+            if (total_deleted > 0 or total_imported_movies > 0 or total_imported_series > 0) and not args.dry_run:
                 if config['notifications']['ntfy']['send_on_success']:
+                    stats = {}
+                    if total_imported_movies > 0 or total_imported_series > 0:
+                        stats['imported_movies'] = total_imported_movies
+                        stats['imported_series'] = total_imported_series
+                    if total_deleted > 0:
+                        stats['deleted_items'] = total_deleted
+                        stats['space_freed_gb'] = f"{total_size_freed / (1024**3):.2f}"
+
                     notifier.notify_success(
                         'seedbox_purge',
-                        f'Deleted {total_deleted} items',
-                        stats={
-                            'items': total_deleted,
-                            'space_freed_gb': f"{total_size_freed / (1024**3):.2f}"
-                        }
+                        f'Imported {total_imported_movies + total_imported_series} items, deleted {total_deleted}',
+                        stats=stats
                     )
 
             logger.info("="*60)
@@ -616,10 +903,19 @@ def comprehensive_purge(config: dict, args) -> bool:
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='Comprehensive seedbox and local cleanup (3-phase strategy)',
+        description='Comprehensive seedbox and local cleanup with auto-import',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-3-Phase Cleanup Strategy:
+4-Phase Processing Strategy:
+
+Phase 0 - Auto-Import:
+  • Scan downloads/_done for unmanaged video files
+  • Parse filenames to extract title/year
+  • Check age ratings via TMDB to identify kids content
+  • Import to appropriate Radarr/Sonarr with correct library path
+  • Update missing ratings automatically
+
+
 
 Phase 1: Active Torrents (XMLRPC)
   - Delete torrents from rtorrent if imported + policy met
@@ -670,6 +966,11 @@ Safety:
     )
 
     # Phase selection
+    parser.add_argument(
+        '--skip-auto-import',
+        action='store_true',
+        help='Skip Phase 0 (auto-import unmanaged files)'
+    )
     parser.add_argument(
         '--skip-torrents',
         action='store_true',

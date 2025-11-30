@@ -211,6 +211,125 @@ class RadarrAPI(BaseAPI):
 
         return movie
 
+    def search_movie(self, title: str, year: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Search for a movie by title.
+
+        Args:
+            title: Movie title
+            year: Release year (optional, helps narrow results)
+
+        Returns:
+            List of search results from Radarr's lookup
+
+        Example:
+            >>> results = radarr.search_movie('The Lion King', 1994)
+            >>> results[0]['tmdbId']
+        """
+        params = {'term': f"{title} {year}" if year else title}
+        return self._request('GET', '/api/v3/movie/lookup', params=params)
+
+    def add_movie(
+        self,
+        tmdb_id: int,
+        title: str,
+        year: int,
+        quality_profile_id: int,
+        root_folder_path: str,
+        monitored: bool = True,
+        search_on_add: bool = True
+    ) -> Dict[str, Any]:
+        """Add a movie to Radarr.
+
+        Args:
+            tmdb_id: TMDB ID of the movie
+            title: Movie title
+            year: Release year
+            quality_profile_id: Quality profile ID (get from /api/v3/qualityprofile)
+            root_folder_path: Root folder path (e.g., '/mnt/media/movies')
+            monitored: Whether to monitor the movie
+            search_on_add: Whether to search for the movie immediately
+
+        Returns:
+            Added movie dictionary
+
+        Example:
+            >>> movie = radarr.add_movie(
+            ...     tmdb_id=8587,
+            ...     title='The Lion King',
+            ...     year=1994,
+            ...     quality_profile_id=1,
+            ...     root_folder_path='/mnt/media/movies'
+            ... )
+        """
+        # Search to get full metadata
+        search_results = self.search_movie(title, year)
+
+        if not search_results:
+            raise APIError(f"Movie not found: {title} ({year})")
+
+        # Find matching movie by TMDB ID
+        movie_data = None
+        for result in search_results:
+            if result.get('tmdbId') == tmdb_id:
+                movie_data = result
+                break
+
+        if not movie_data:
+            raise APIError(f"Movie with TMDB ID {tmdb_id} not found in search results")
+
+        # Prepare movie data for adding
+        movie_data.update({
+            'qualityProfileId': quality_profile_id,
+            'rootFolderPath': root_folder_path,
+            'monitored': monitored,
+            'addOptions': {
+                'searchForMovie': search_on_add
+            }
+        })
+
+        return self._request('POST', '/api/v3/movie', json=movie_data)
+
+    def update_movie(self, movie_id: int, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Update movie metadata.
+
+        Args:
+            movie_id: Movie ID
+            updates: Dictionary of fields to update
+
+        Returns:
+            Updated movie dictionary
+
+        Example:
+            >>> radarr.update_movie(1, {'certification': 'PG'})
+        """
+        movie = self.get_movie(movie_id)
+        movie.update(updates)
+        return self._request('PUT', f'/api/v3/movie/{movie_id}', json=movie)
+
+    def get_quality_profiles(self) -> List[Dict[str, Any]]:
+        """Get available quality profiles.
+
+        Returns:
+            List of quality profile dictionaries
+
+        Example:
+            >>> profiles = radarr.get_quality_profiles()
+            >>> profiles[0]['id']  # 1
+        """
+        return self._request('GET', '/api/v3/qualityprofile')
+
+    def get_root_folders(self) -> List[Dict[str, Any]]:
+        """Get available root folders.
+
+        Returns:
+            List of root folder dictionaries
+
+        Example:
+            >>> folders = radarr.get_root_folders()
+            >>> folders[0]['path']  # '/mnt/media/movies'
+        """
+        return self._request('GET', '/api/v3/rootfolder')
+
     def get_history(self, event_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get history events.
 
@@ -336,6 +455,128 @@ class SonarrAPI(BaseAPI):
             return self._request('PUT', f'/api/v3/series/{series_id}', json=series)
 
         return series
+
+    def search_series(self, title: str, year: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Search for a TV series by title.
+
+        Args:
+            title: Series title
+            year: First air year (optional, helps narrow results)
+
+        Returns:
+            List of search results from Sonarr's lookup
+
+        Example:
+            >>> results = sonarr.search_series('Breaking Bad', 2008)
+            >>> results[0]['tvdbId']
+        """
+        params = {'term': f"{title} {year}" if year else title}
+        return self._request('GET', '/api/v3/series/lookup', params=params)
+
+    def add_series(
+        self,
+        tvdb_id: int,
+        title: str,
+        year: int,
+        quality_profile_id: int,
+        root_folder_path: str,
+        monitored: bool = True,
+        search_on_add: bool = True,
+        season_folder: bool = True
+    ) -> Dict[str, Any]:
+        """Add a series to Sonarr.
+
+        Args:
+            tvdb_id: TVDB ID of the series
+            title: Series title
+            year: First air year
+            quality_profile_id: Quality profile ID (get from /api/v3/qualityprofile)
+            root_folder_path: Root folder path (e.g., '/mnt/media/series')
+            monitored: Whether to monitor the series
+            search_on_add: Whether to search for episodes immediately
+            season_folder: Whether to use season folders
+
+        Returns:
+            Added series dictionary
+
+        Example:
+            >>> series = sonarr.add_series(
+            ...     tvdb_id=81189,
+            ...     title='Breaking Bad',
+            ...     year=2008,
+            ...     quality_profile_id=1,
+            ...     root_folder_path='/mnt/media/series'
+            ... )
+        """
+        # Search to get full metadata
+        search_results = self.search_series(title, year)
+
+        if not search_results:
+            raise APIError(f"Series not found: {title} ({year})")
+
+        # Find matching series by TVDB ID
+        series_data = None
+        for result in search_results:
+            if result.get('tvdbId') == tvdb_id:
+                series_data = result
+                break
+
+        if not series_data:
+            raise APIError(f"Series with TVDB ID {tvdb_id} not found in search results")
+
+        # Prepare series data for adding
+        series_data.update({
+            'qualityProfileId': quality_profile_id,
+            'rootFolderPath': root_folder_path,
+            'monitored': monitored,
+            'seasonFolder': season_folder,
+            'addOptions': {
+                'searchForMissingEpisodes': search_on_add
+            }
+        })
+
+        return self._request('POST', '/api/v3/series', json=series_data)
+
+    def update_series(self, series_id: int, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Update series metadata.
+
+        Args:
+            series_id: Series ID
+            updates: Dictionary of fields to update
+
+        Returns:
+            Updated series dictionary
+
+        Example:
+            >>> sonarr.update_series(1, {'certification': 'TV-PG'})
+        """
+        series = self.get_series_by_id(series_id)
+        series.update(updates)
+        return self._request('PUT', f'/api/v3/series/{series_id}', json=series)
+
+    def get_quality_profiles(self) -> List[Dict[str, Any]]:
+        """Get available quality profiles.
+
+        Returns:
+            List of quality profile dictionaries
+
+        Example:
+            >>> profiles = sonarr.get_quality_profiles()
+            >>> profiles[0]['id']  # 1
+        """
+        return self._request('GET', '/api/v3/qualityprofile')
+
+    def get_root_folders(self) -> List[Dict[str, Any]]:
+        """Get available root folders.
+
+        Returns:
+            List of root folder dictionaries
+
+        Example:
+            >>> folders = sonarr.get_root_folders()
+            >>> folders[0]['path']  # '/mnt/media/series'
+        """
+        return self._request('GET', '/api/v3/rootfolder')
 
     def get_history(self, event_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get history events.
