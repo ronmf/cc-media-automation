@@ -85,8 +85,8 @@ set xfer:temp-file-name *{lftp['temp_suffix']}
     # Mirror command
     mirror_opts = f"-P {lftp['parallel_files']} -c -v"
 
-    # Exclude unwanted files
-    mirror_opts += ' --exclude "*.meta"'
+    # Exclude unwanted files (regex pattern)
+    mirror_opts += ' --exclude ".*\\.meta$"'
 
     # Only remove source files if not in dry-run mode
     if not dry_run:
