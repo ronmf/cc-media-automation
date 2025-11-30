@@ -803,10 +803,10 @@ def purge_remote_files(
         ) as ssh:
             logger.info(f"Connected to seedbox via SSH")
 
-            # List all files in /downloads
+            # List all files in /downloads (find command is recursive by default)
             logger.info(f"Scanning {sb['remote_downloads']}...")
-            remote_files = ssh.list_files(sb['remote_downloads'], recursive=True)
-            logger.info(f"Found {len(remote_files)} files/folders")
+            remote_files = ssh.list_files(sb['remote_downloads'])
+            logger.info(f"Found {len(remote_files)} files")
 
             # Check each file
             for file_info in remote_files:
