@@ -311,36 +311,51 @@ def get_video_files(directory: str) -> List[str]:
 def find_main_video(video_files: List[str], min_size_mb: int = 500) -> Optional[str]:
     """Find the main video file in a list (largest file above minimum size).
 
+    If no files meet the minimum size, returns the largest file anyway.
+    This handles legitimate small episodes (anime, sitcoms, AV1-compressed content).
+
     Args:
         video_files: List of video file paths
-        min_size_mb: Minimum size in MB to be considered main video
+        min_size_mb: Minimum size in MB to be considered main video (preference only)
 
     Returns:
-        Path to main video file, or None if no suitable file found
+        Path to main video file, or None if no files found
 
     Example:
         >>> videos = get_video_files('/mnt/media/movies/Movie (2020)')
         >>> main = find_main_video(videos)
         >>> print(f"Main video: {main}")
     """
+    if not video_files:
+        return None
+
     min_size_bytes = min_size_mb * 1024 * 1024
 
-    # Filter files by minimum size
-    large_files = []
+    # Collect all files with their sizes
+    large_files = []  # Files meeting minimum size
+    all_files = []    # All files (fallback)
+
     for filepath in video_files:
         try:
             size = os.path.getsize(filepath)
+            all_files.append((filepath, size))
             if size >= min_size_bytes:
                 large_files.append((filepath, size))
         except OSError:
             continue
 
-    if not large_files:
-        return None
+    # Prefer files meeting minimum size
+    if large_files:
+        large_files.sort(key=lambda x: x[1], reverse=True)
+        return large_files[0][0]
 
-    # Return largest file
-    large_files.sort(key=lambda x: x[1], reverse=True)
-    return large_files[0][0]
+    # Fallback: return largest file even if below threshold
+    # (handles anime episodes, sitcoms, highly compressed content)
+    if all_files:
+        all_files.sort(key=lambda x: x[1], reverse=True)
+        return all_files[0][0]
+
+    return None
 
 
 def cleanup_temp_files(directory: str, pattern: str = '*.lftp') -> int:
