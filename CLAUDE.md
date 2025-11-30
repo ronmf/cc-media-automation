@@ -52,7 +52,8 @@ Automated media server management suite for Servarr stack with seedbox integrati
 │
 ├── utils/                       # Shared modules
 │   ├── config_loader.py
-│   ├── api_clients.py
+│   ├── api_clients.py          # ✨ ENHANCED: Radarr/Sonarr search/add/update methods
+│   ├── tmdb_client.py          # ✨ NEW: TMDB API client for age ratings
 │   ├── rtorrent_client.py       # ✨ NEW: XMLRPC client for rtorrent
 │   ├── ntfy_notifier.py
 │   ├── logger.py
@@ -74,14 +75,17 @@ Automated media server management suite for Servarr stack with seedbox integrati
    - Remove source files after successful transfer
    - Clean up `*.lftp` temp files
 
-2. **`seedbox_purge.py`** - ✨ 3-Phase Comprehensive Cleanup
+2. **`seedbox_purge.py`** - ✨ 4-Phase: Auto-Import + Cleanup
+   - **Phase 0 (Auto-Import)**: Parse unmanaged files → TMDB age rating → route to kids/adult libraries
    - **Phase 1 (XMLRPC)**: Delete torrents by hash matching (downloadId)
    - **Phase 2 (SSH)**: Clean orphaned remote /downloads files
    - **Phase 3 (Filesystem)**: Purge local _done staging files
    - Policy: ratio >= 1.5 OR age >= 2 days
+   - Kids content: G, PG, TV-Y, TV-Y7, TV-G, TV-PG → kids_movies/kids_series
+   - Adult content: Everything else → movies/series
    - 100% accurate hash-based matching
    - Monitor 750GB quota (warn at 700GB)
-   - Flags: --skip-torrents, --skip-remote-files, --skip-local-done
+   - Flags: --skip-auto-import, --skip-torrents, --skip-remote-files, --skip-local-done
 
    **Note**: For legacy SSH-only file cleanup, use `seedbox_file_cleanup.py`
 
@@ -218,6 +222,37 @@ docker exec radarr ls -lah /media/movies
 ---
 
 ## API Quick Reference
+
+### ✨ TMDB API (The Movie Database)
+**Endpoint**: `https://api.themoviedb.org/3`
+**Auth**: API Key in query parameter
+**Purpose**: Fetch age ratings and metadata for movies/TV shows
+
+```python
+from utils.tmdb_client import create_tmdb_client
+
+tmdb = create_tmdb_client(config)
+
+# Search for content
+movies = tmdb.search_movie('The Lion King', 1994)
+series = tmdb.search_tv('Avatar: The Last Airbender', 2005)
+
+# Get age ratings
+cert = tmdb.get_movie_certification('The Lion King', 1994)  # Returns: 'G'
+rating = tmdb.get_tv_certification('Breaking Bad', 2008)    # Returns: 'TV-MA'
+
+# Determine if kids content
+is_kids = tmdb.is_kids_content(
+    'The Lion King', 1994, 'movie',
+    kids_ratings=['G', 'PG', 'TV-Y', 'TV-Y7', 'TV-G']
+)  # Returns: True
+```
+
+**Key Notes**:
+- Free API key from https://www.themoviedb.org/settings/api
+- Rate limits: 40 requests per 10 seconds
+- Certifications: US-based (MPAA for movies, TV Parental Guidelines for series)
+- Returns None if no rating found
 
 ### ✨ rtorrent XMLRPC (via ruTorrent httprpc)
 **Endpoint**: `https://nl3864.dediseedbox.com/rutorrent/plugins/httprpc/action.php`

@@ -11,6 +11,8 @@
 ## 🎯 Overview
 
 Automated media server management suite for Servarr stack (Radarr, Sonarr) with:
+- **Auto-import with age rating detection** - Automatically add unmanaged files to correct libraries
+- **Kids content segregation** - TMDB-based rating detection routes content to appropriate folders
 - **Hash-based seedbox purge** - 100% accurate torrent deletion via XMLRPC
 - **Parallel downloads** - lftp synchronization with 6 files × 8 connections
 - **Video cleanup** - Automatic removal of extras, trailers, samples
@@ -90,11 +92,13 @@ python3 scripts/seedbox_purge.py --dry-run --verbose
 | Script | Purpose | Frequency | Priority |
 |--------|---------|-----------|----------|
 | **seedbox_sync.py** | lftp parallel downloads | Every 30 min | HIGH |
-| **seedbox_purge.py** | 3-phase cleanup (torrents + files) | Daily at 3 AM | HIGH |
+| **seedbox_purge.py** | 4-phase: auto-import + cleanup | Daily at 3 AM | HIGH |
 | **video_cleanup.py** | Remove extras/trailers | Weekly | MEDIUM |
 | **jellyfin_notify.py** | Trigger library scans | Every 10 min | MEDIUM |
 | **library_analyzer.py** | Watch pattern analysis | Monthly | LOW |
 | **library_reducer.py** | Tag deletion candidates | Manual | LOW |
+
+**Note**: `seedbox_purge.py` now includes Phase 0 (auto-import with age rating detection) before the 3 cleanup phases.
 
 ---
 
@@ -201,6 +205,98 @@ for hash_id in rtorrent_seeding_torrents:
 ```
 
 **Result**: 100% accurate matching, no filename parsing errors.
+
+---
+
+## 🎬 Auto-Import with Age Rating Detection
+
+The `seedbox_purge.py` script now includes **Phase 0** - intelligent auto-import that automatically adds unmanaged files to Radarr/Sonarr with kids content segregation based on TMDB age ratings.
+
+### How It Works
+
+1. **Scan** - Finds video files in `downloads/_done` directory
+2. **Parse** - Extracts title, year, and content type (movie/series) from filenames
+3. **Check** - Verifies if already in Radarr/Sonarr libraries
+4. **Rate** - Fetches age rating from TMDB (G, PG, PG-13, R, TV-Y, TV-PG, TV-14, etc.)
+5. **Route** - Determines appropriate library based on rating:
+   - **Kids Content** → `kids_movies` or `kids_series`
+   - **Adult Content** → `movies` or `series`
+6. **Import** - Adds to Radarr/Sonarr with correct root folder and quality profile
+
+### Age Rating Classification
+
+**Movies:**
+- `G`, `PG` → Kids Movies (`/mnt/media/kids_movies`)
+- `PG-13`, `R`, `NC-17` → Movies (`/mnt/media/movies`)
+
+**TV Series:**
+- `TV-Y`, `TV-Y7`, `TV-G`, `TV-PG` → Kids Series (`/mnt/media/kids_series`)
+- `TV-14`, `TV-MA` → Series (`/mnt/media/series`)
+
+**Unknown Ratings:** Default to adult library (safer for parental controls)
+
+### Configuration
+
+Add to `config.yaml`:
+
+```yaml
+# TMDB Configuration (required for auto-import)
+tmdb:
+  api_key: "YOUR_API_KEY"  # Get from https://www.themoviedb.org/settings/api
+  language: "en-US"
+  include_adult: false
+
+# Auto-import settings
+thresholds:
+  auto_import_enabled: true
+  kids_age_ratings:
+    movies: ["G", "PG", "TV-Y", "TV-Y7", "TV-G"]
+    series: ["TV-Y", "TV-Y7", "TV-G", "TV-PG"]
+  update_missing_ratings: true
+```
+
+### Usage Examples
+
+```bash
+# Run all phases including auto-import
+python3 scripts/seedbox_purge.py --execute
+
+# Only run auto-import (skip cleanup phases)
+python3 scripts/seedbox_purge.py --execute --skip-torrents --skip-remote-files --skip-local-done
+
+# Skip auto-import, only run cleanup
+python3 scripts/seedbox_purge.py --execute --skip-auto-import
+
+# Dry-run to see what would be imported
+python3 scripts/seedbox_purge.py --dry-run --verbose
+```
+
+### Sample Output
+
+```
+══════════════════════════════════════════════════════════
+PHASE 0: AUTO-IMPORT UNMANAGED FILES
+══════════════════════════════════════════════════════════
+Found 15 video files in /mnt/media/downloads/_done
+📥 Importing movie: The Lion King (1994) [kids] → /mnt/media/kids_movies
+📥 Importing movie: The Matrix (1999) [adult] → /mnt/media/movies
+📥 Importing series: Avatar The Last Airbender (2005) [kids] → /mnt/media/kids_series
+📥 Importing series: Breaking Bad (2008) [adult] → /mnt/media/series
+
+Movies imported: 8
+Series imported: 5
+Skipped (already in library): 2
+Failed: 0
+Total processed: 15
+```
+
+### Benefits
+
+- **Zero Manual Work** - Automatically manages untracked files
+- **Parental Control** - Kids content segregated automatically
+- **Accurate Routing** - TMDB ratings ensure correct classification
+- **Metadata Enrichment** - Updates missing ratings automatically
+- **Flexible Control** - Skip phase with `--skip-auto-import` flag
 
 ---
 
