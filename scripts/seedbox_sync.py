@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Seedbox synchronization script with lftp.
+"""Seedbox synchronization script with lftp over SFTP.
 
-This script syncs downloads from the seedbox to local storage using lftp,
-fixing the folder issues from the original bash script. It mirrors files
-from the remote /downloads directory to /mnt/media/downloads/_done.
+This script syncs downloads from the seedbox to local storage using lftp
+over SFTP (SSH File Transfer Protocol). It mirrors files from the remote
+/downloads directory to the local downloads/_done directory.
 
 Features:
-- lftp mirror with parallel downloads
+- lftp mirror over SFTP (secure SSH connection)
+- Parallel downloads with pget (multiple connections per file)
 - Remove source files after successful transfer
 - Clean up *.lftp temp files
 - Lock file to prevent concurrent execution
@@ -22,6 +23,10 @@ Usage:
 
     # Custom config file
     python3 scripts/seedbox_sync.py --execute --config /path/to/config.yaml
+
+Note:
+    dediseedbox.com uses SFTP (SSH protocol on port 40685), not FTP.
+    The script automatically uses sftp:// protocol for connection.
 """
 
 import sys
@@ -62,9 +67,9 @@ def build_lftp_command(config: dict, dry_run: bool = False) -> str:
     # Build log file path relative to project
     lftp_log = logs_dir / 'seedbox_sync_lftp.log'
 
-    # Build lftp command
-    cmd = f"""lftp -p {sb['port']} -u {sb['username']},{sb['password']} {sb['host']} << 'EOF'
-set ftp:ssl-allow {'yes' if lftp['ssl_allow'] else 'no'}
+    # Build lftp command using SFTP protocol (dediseedbox uses SSH)
+    cmd = f"""lftp -u {sb['username']},{sb['password']} sftp://{sb['host']}:{sb['port']} << 'EOF'
+set sftp:auto-confirm yes
 set net:timeout {lftp['timeout']}
 set net:max-retries {lftp['max_retries']}
 set net:reconnect-interval-base {lftp['reconnect_interval_base']}
